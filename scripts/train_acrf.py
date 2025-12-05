@@ -471,7 +471,8 @@ def main():
     logger.info("="*60)
     
     global_step = 0
-    progress_bar = tqdm(total=args.max_train_steps, desc="Training")
+    # 禁用 tqdm 显示，改用 [STEP] 格式输出（避免日志重复）
+    progress_bar = tqdm(total=args.max_train_steps, desc="Training", disable=True)
     
     # EMA 平滑 loss（用于显示趋势，不影响训练）
     ema_loss = None
@@ -560,17 +561,11 @@ def main():
                 else:
                     ema_loss = ema_decay * ema_loss + (1 - ema_decay) * current_loss
                 
-                # 显示：当前 loss、EMA 和学习率
+                # 获取当前学习率
                 current_lr = lr_scheduler.get_last_lr()[0]
-                progress_bar.set_postfix({
-                    "loss": f"{current_loss:.4f}",
-                    "ema": f"{ema_loss:.4f}",
-                    "lr": f"{current_lr:.2e}"
-                })
                 
-                # 定期打印进度供前端解析（每10步或每步都打印）
-                if global_step % 1 == 0:  # 每步都打印
-                    print(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema_loss={ema_loss:.4f} lr={current_lr:.2e}", flush=True)
+                # 打印进度供前端解析（唯一的进度输出）
+                print(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema_loss={ema_loss:.4f} lr={current_lr:.2e}", flush=True)
                 
             # 执行内存优化 (清理缓存等)
             memory_optimizer.optimize_training_step()
