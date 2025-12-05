@@ -412,6 +412,9 @@ def main():
     logger.info(f"  Num Batches per Epoch = {len(dataloader)}")
     logger.info(f"  Gradient Accumulation = {args.gradient_accumulation_steps}")
     logger.info(f"  Total Optimization Steps = {args.max_train_steps}")
+    
+    # 打印总步数供前端解析（关键！tqdm 的 \r 输出无法被 readline 捕获）
+    print(f"[TRAINING_INFO] total_steps={args.max_train_steps} total_epochs={args.num_train_epochs}", flush=True)
 
     # 6. 创建优化器
     logger.info(f"\n[SETUP] 初始化优化器: {args.optimizer_type}")
@@ -564,6 +567,10 @@ def main():
                     "ema": f"{ema_loss:.4f}",
                     "lr": f"{current_lr:.2e}"
                 })
+                
+                # 定期打印进度供前端解析（每10步或每步都打印）
+                if global_step % 1 == 0:  # 每步都打印
+                    print(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema_loss={ema_loss:.4f} lr={current_lr:.2e}", flush=True)
                 
             # 执行内存优化 (清理缓存等)
             memory_optimizer.optimize_training_step()

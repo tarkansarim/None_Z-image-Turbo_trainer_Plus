@@ -346,12 +346,58 @@ def sync_broadcast_generation_progress(current_step: int, total_steps: int, stag
 def parse_training_progress(line: str) -> Optional[Dict[str, Any]]:
     """解析训练进度信息
     
-    只解析真正的训练进度（带 tqdm 进度条、loss、lr），
-    忽略模型加载阶段的日志（如 "Loading 1/6"）
+    支持格式：
+    1. [TRAINING_INFO] total_steps=3000 total_epochs=100  (启动时的总步数信息)
+    2. [STEP] 50/3000 epoch=1/100 loss=0.1234 ema_loss=0.1200 lr=1.00e-04  (每步进度)
+    3. tqdm 进度条格式 (备用)
     """
     import re
     
     result = {}
+    
+    # 优先匹配 [TRAINING_INFO] 格式（启动时的总步数信息）
+    if '[TRAINING_INFO]' in line:
+        total_steps_match = re.search(r'total_steps=(\d+)', line)
+        total_epochs_match = re.search(r'total_epochs=(\d+)', line)
+        if total_steps_match:
+            result["step"] = {
+                "current": 0,
+                "total": int(total_steps_match.group(1))
+            }
+        if total_epochs_match:
+            result["epoch"] = {
+                "current": 0,
+                "total": int(total_epochs_match.group(1))
+            }
+        return result if result else None
+    
+    # 优先匹配 [STEP] 格式（每步进度，最可靠）
+    if '[STEP]' in line:
+        step_match = re.search(r'\[STEP\]\s*(\d+)/(\d+)', line)
+        if step_match:
+            result["step"] = {
+                "current": int(step_match.group(1)),
+                "total": int(step_match.group(2))
+            }
+        epoch_match = re.search(r'epoch=(\d+)/(\d+)', line)
+        if epoch_match:
+            result["epoch"] = {
+                "current": int(epoch_match.group(1)),
+                "total": int(epoch_match.group(2))
+            }
+        loss_match = re.search(r'loss=([0-9.]+)', line)
+        if loss_match:
+            result["loss"] = float(loss_match.group(1))
+        ema_match = re.search(r'ema_loss=([0-9.]+)', line)
+        if ema_match:
+            result["ema_loss"] = float(ema_match.group(1))
+        lr_match = re.search(r'lr=([0-9.e+-]+)', line)
+        if lr_match:
+            try:
+                result["learningRate"] = float(lr_match.group(1))
+            except:
+                pass
+        return result if result else None
     
     # 先检查是否是模型加载日志（跳过）
     if any(keyword in line.lower() for keyword in ['loading', 'load', '加载', 'initializing', 'preparing']):
