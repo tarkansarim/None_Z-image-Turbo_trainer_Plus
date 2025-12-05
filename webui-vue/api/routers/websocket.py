@@ -157,7 +157,7 @@ class ConnectionManager:
                 try:
                     fd = process.stdout.fileno()
                     handle = msvcrt.get_osfhandle(fd)
-                    except:
+                except:
                     return
                 
                 while lines_read < max_lines:
