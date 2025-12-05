@@ -1,0 +1,49 @@
+# Z-Image AC-RF 训练配置 (自动生成)
+# 生成时间: 2025-12-05T17:34:55.184843
+
+[model]
+dit = "D:/AI/None_Z-image-Turbo_trainer/zimage_models/transformer"
+output_dir = "D:/AI/None_Z-image-Turbo_trainer/output"
+
+[acrf]
+turbo_steps = 10
+shift = 3
+jitter_scale = 0.02
+
+[lora]
+network_dim = 16
+network_alpha = 16
+
+[training]
+optimizer_type = "AdamW8bit"
+learning_rate = 0.0001
+weight_decay = 0
+lr_scheduler = "cosine_with_restarts"
+lr_warmup_steps = 100
+lr_num_cycles = 1
+lambda_fft = 0
+lambda_cosine = 0
+snr_gamma = 5
+num_train_epochs = 10
+save_every_n_epochs = 1
+gradient_accumulation_steps = 4
+mixed_precision = "bf16"
+seed = 42
+
+[advanced]
+max_grad_norm = 1
+gradient_checkpointing = true
+
+[optimization]
+auto_optimize = true
+
+# ============ Dataset 配置 ============
+[dataset]
+batch_size = 1
+shuffle = true
+enable_bucket = true
+
+[[dataset.sources]]
+cache_directory = "D:/AI/None_Z-image-Turbo_trainer/datasets/Qwen_image_insgirl_v1_1024/Qwen_image_insgirl_v1_1024/size_1024"
+num_repeats = 1
+resolution_limit = 1024

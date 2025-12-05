@@ -1,0 +1,325 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+import subprocess
+import sys
+import os
+import threading
+from pathlib import Path
+from core.config import PROJECT_ROOT
+from core import state
+
+router = APIRouter(prefix="/api/cache", tags=["cache"])
+
+# Windows 兼容性：获取 subprocess 创建标志
+def _get_subprocess_flags():
+    """获取跨平台 subprocess 创建标志"""
+    if os.name == 'nt':
+        # Windows: 隐藏命令行窗口
+        return subprocess.CREATE_NO_WINDOW
+    return 0
+
+class CacheGenerationRequest(BaseModel):
+    datasetPath: str
+    generateLatent: bool
+    generateText: bool
+    vaePath: str
+    textEncoderPath: str
+    resolution: int = 1024
+    batchSize: int = 1
+
+# 存储待执行的 text cache 参数
+_pending_text_cache: dict = {}
+
+def _start_text_cache_after_latent():
+    """等待 latent 完成后启动 text cache（后台线程）"""
+    global _pending_text_cache
+    
+    if not _pending_text_cache:
+        return
+    
+    # 等待 latent 完成
+    if state.cache_latent_process:
+        state.cache_latent_process.wait()
+        state.add_log("Latent cache 完成，开始 Text cache...", "info")
+    
+    # 启动 text cache
+    params = _pending_text_cache
+    _pending_text_cache = {}
+    
+    if params:
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+        env["PYTHONUNBUFFERED"] = "1"
+        
+        cmd_text = [
+            sys.executable, "-m", "zimage_trainer.cache_text_encoder",
+            "--text_encoder", params["text_encoder"],
+            "--input_dir", params["input_dir"],
+            "--output_dir", params["output_dir"],
+            "--skip_existing"
+        ]
+        
+        state.cache_text_process = subprocess.Popen(
+            cmd_text,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1,
+            creationflags=_get_subprocess_flags()
+        )
+        state.add_log(f"Text cache started (PID: {state.cache_text_process.pid})", "info")
+
+@router.post("/generate")
+async def generate_cache(request: CacheGenerationRequest):
+    """Generate latent and/or text encoder cache for a dataset
+    
+    重要：当同时请求 latent 和 text 时，会**顺序执行**（先 latent 后 text），
+    避免低显存机器同时加载 VAE 和 Text Encoder 导致 OOM。
+    """
+    global _pending_text_cache
+    
+    # 检查是否有缓存任务正在运行
+    if state.cache_latent_process and state.cache_latent_process.poll() is None:
+        raise HTTPException(status_code=400, detail="Latent cache generation already in progress")
+    if state.cache_text_process and state.cache_text_process.poll() is None:
+        raise HTTPException(status_code=400, detail="Text cache generation already in progress")
+    
+    dataset_path = Path(request.datasetPath)
+    if not dataset_path.exists():
+        raise HTTPException(status_code=404, detail="Dataset path not found")
+    
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(PROJECT_ROOT / "src")
+    env["PYTHONUNBUFFERED"] = "1"
+    
+    started_tasks = []
+    
+    # Latent Cache (先执行)
+    if request.generateLatent:
+        if not request.vaePath:
+            raise HTTPException(status_code=400, detail="VAE path is required for latent caching")
+        
+        cmd_latent = [
+            sys.executable, "-m", "zimage_trainer.cache_latents",
+            "--vae", request.vaePath,
+            "--input_dir", str(dataset_path),
+            "--output_dir", str(dataset_path),
+            "--resolution", str(request.resolution),
+            "--batch_size", str(request.batchSize),
+            "--skip_existing"
+        ]
+        
+        state.cache_latent_process = subprocess.Popen(
+            cmd_latent,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1,
+            creationflags=_get_subprocess_flags()
+        )
+        state.add_log(f"Latent cache started (PID: {state.cache_latent_process.pid})", "info")
+        started_tasks.append("latent")
+    
+    # Text Encoder Cache
+    if request.generateText:
+        if not request.textEncoderPath:
+            raise HTTPException(status_code=400, detail="Text Encoder path is required for text caching")
+        
+        # 如果同时请求了 latent，则排队等待（顺序执行）
+        if request.generateLatent:
+            _pending_text_cache = {
+                "text_encoder": request.textEncoderPath,
+                "input_dir": str(dataset_path),
+                "output_dir": str(dataset_path)
+            }
+            state.add_log("Text cache 已排队，将在 Latent cache 完成后自动开始", "info")
+            started_tasks.append("text (queued)")
+            
+            # 启动后台线程等待 latent 完成
+            thread = threading.Thread(target=_start_text_cache_after_latent, daemon=True)
+            thread.start()
+        else:
+            # 只请求 text，直接执行
+            cmd_text = [
+                sys.executable, "-m", "zimage_trainer.cache_text_encoder",
+                "--text_encoder", request.textEncoderPath,
+                "--input_dir", str(dataset_path),
+                "--output_dir", str(dataset_path),
+                "--skip_existing"
+            ]
+            
+            state.cache_text_process = subprocess.Popen(
+                cmd_text,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+                creationflags=_get_subprocess_flags()
+            )
+            state.add_log(f"Text cache started (PID: {state.cache_text_process.pid})", "info")
+            started_tasks.append("text")
+    
+    if not started_tasks:
+        raise HTTPException(status_code=400, detail="No cache type selected")
+    
+    return {
+        "success": True, 
+        "message": f"Cache generation started: {', '.join(started_tasks)}",
+        "tasks": started_tasks
+    }
+
+@router.post("/stop")
+async def stop_cache():
+    """Stop cache generation with proper cleanup"""
+    import gc
+    stopped = []
+    
+    if state.cache_latent_process and state.cache_latent_process.poll() is None:
+        pid = state.cache_latent_process.pid
+        state.cache_latent_process.terminate()
+        try:
+            state.cache_latent_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            state.cache_latent_process.kill()
+            state.cache_latent_process.wait(timeout=5)
+        state.cache_latent_process = None
+        stopped.append("latent")
+        state.add_log(f"Latent cache stopped (PID: {pid})", "warning")
+    
+    if state.cache_text_process and state.cache_text_process.poll() is None:
+        pid = state.cache_text_process.pid
+        state.cache_text_process.terminate()
+        try:
+            state.cache_text_process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            state.cache_text_process.kill()
+            state.cache_text_process.wait(timeout=5)
+        state.cache_text_process = None
+        stopped.append("text")
+        state.add_log(f"Text cache stopped (PID: {pid})", "warning")
+    
+    # 清理
+    gc.collect()
+    state.reset_cache_progress()
+    
+    return {"success": True, "stopped": stopped}
+
+@router.get("/status")
+async def get_cache_status():
+    """Get cache generation status"""
+    
+    def get_process_status(process, name):
+        if process is None:
+            return {"status": "idle"}
+        
+        return_code = process.poll()
+        if return_code is None:
+            return {"status": "running"}
+        elif return_code == 0:
+            return {"status": "completed"}
+        else:
+            return {"status": "failed", "code": return_code}
+    
+    return {
+        "latent": get_process_status(state.cache_latent_process, "latent"),
+        "text": get_process_status(state.cache_text_process, "text")
+    }
+
+class CacheClearRequest(BaseModel):
+    datasetPath: str
+    clearLatent: bool = False
+    clearText: bool = False
+
+class CacheCheckRequest(BaseModel):
+    datasetPath: str
+
+@router.post("/check")
+async def check_cache_status(request: CacheCheckRequest):
+    """检查数据集的缓存完整性"""
+    dataset_path = Path(request.datasetPath)
+    if not dataset_path.exists():
+        raise HTTPException(status_code=404, detail="Dataset path not found")
+    
+    # 查找所有图片
+    image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
+    images = []
+    for f in dataset_path.rglob("*"):
+        if f.is_file() and f.suffix.lower() in image_extensions:
+            images.append(f)
+    
+    total_images = len(images)
+    latent_cached = 0
+    text_cached = 0
+    
+    # 检查每个图片的缓存
+    for img in images:
+        stem = img.stem
+        parent = img.parent
+        
+        # 检查 latent 缓存 (格式: {name}_{WxH}_zi.safetensors)
+        latent_files = list(parent.glob(f"{stem}_*_zi.safetensors"))
+        if latent_files:
+            latent_cached += 1
+        
+        # 检查 text 缓存 (格式: {name}_zi_te.safetensors)
+        text_files = list(parent.glob(f"{stem}_zi_te.safetensors"))
+        if text_files:
+            text_cached += 1
+    
+    return {
+        "total_images": total_images,
+        "latent_cached": latent_cached,
+        "text_cached": text_cached,
+        "latent_complete": latent_cached >= total_images,
+        "text_complete": text_cached >= total_images,
+        "all_complete": latent_cached >= total_images and text_cached >= total_images
+    }
+
+@router.post("/clear")
+async def clear_cache(request: CacheClearRequest):
+    """Clear latent and/or text encoder cache for a dataset"""
+    dataset_path = Path(request.datasetPath)
+    if not dataset_path.exists():
+        raise HTTPException(status_code=404, detail="Dataset path not found")
+    
+    deleted_count = 0
+    errors = []
+    
+    # Define patterns to delete
+    patterns = []
+    if request.clearLatent:
+        patterns.append("*_zi.safetensors")
+    if request.clearText:
+        patterns.append("*_zi_te.safetensors")
+    
+    if not patterns:
+        return {"success": True, "deleted": 0, "message": "No cache type selected"}
+    
+    try:
+        for pattern in patterns:
+            # Recursive search
+            for file in dataset_path.rglob(pattern):
+                try:
+                    file.unlink()
+                    deleted_count += 1
+                except Exception as e:
+                    errors.append(f"{file.name}: {str(e)}")
+        
+        state.add_log(f"Cleared {deleted_count} cache files", "info")
+        
+        return {
+            "success": True, 
+            "deleted": deleted_count, 
+            "errors": errors
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear cache: {str(e)}")
