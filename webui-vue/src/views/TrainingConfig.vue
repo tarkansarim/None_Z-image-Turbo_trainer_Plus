@@ -11,7 +11,7 @@
           </el-select>
           <el-button @click="showNewConfigDialog = true" :icon="Plus">新建</el-button>
           <el-button @click="showSaveAsDialog = true" :icon="Document">另存为</el-button>
-          <el-button type="primary" @click="saveCurrentConfig" :loading="saving" :icon="Check">保存</el-button>
+          <el-button type="primary" @click="saveCurrentConfig" :loading="saving" :icon="Check">发送训练器</el-button>
           <el-button type="danger" @click="deleteCurrentConfig" :disabled="currentConfigName === 'default'" :icon="Delete">删除</el-button>
         </div>
       </div>
@@ -680,7 +680,7 @@ async function saveCurrentConfig() {
       name: currentConfigName.value,
       config: config.value
     })
-    ElMessage.success('配置已保存')
+    ElMessage.success('配置已发送到训练器')
     await loadConfigList()
   } catch (e: any) {
     ElMessage.error('保存失败: ' + (e.response?.data?.detail || e.message))

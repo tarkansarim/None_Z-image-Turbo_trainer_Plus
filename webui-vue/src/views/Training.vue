@@ -27,7 +27,7 @@
           Step {{ progress.currentStep }}/{{ progress.totalSteps }}
         </p>
         <p v-else-if="isStarting">正在启动...</p>
-        <p v-else>点击此处开始训练</p>
+        <p v-else>点击此处开始训练（请先确认配置参数）</p>
       </div>
       <div class="status-progress" v-if="isRunning && !isLoading">
         <el-progress
@@ -353,9 +353,14 @@ function clearLogs() {
 async function startTraining() {
   try {
     await ElMessageBox.confirm(
-      '确定要开始训练吗？请确保配置已正确设置。',
-      '开始训练',
-      { confirmButtonText: '开始', cancelButtonText: '取消', type: 'info' }
+      '⚠️ 请确认以下参数后再开始训练：\n\n' +
+      '• 数据集路径是否正确\n' +
+      '• 训练轮数 (Epochs) 是否合适\n' +
+      '• 学习率和调度器设置\n' +
+      '• LoRA 参数 (Rank/Alpha)\n\n' +
+      '配置可在「训练配置」页面修改。',
+      '确认开始训练',
+      { confirmButtonText: '确认开始', cancelButtonText: '取消', type: 'warning' }
     )
   } catch {
     return
