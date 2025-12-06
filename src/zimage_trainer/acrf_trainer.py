@@ -231,50 +231,74 @@ class ACRFTrainer:
 
     def _compute_fft_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        计算 Latent 空间的 FFT Loss
-        支持任意尺寸，使用全精度FFT避免2的幂次方限制
+        高通补偿 FFT Loss - 只监督基础 loss 覆盖不到的高频区域
+        
+        设计理念：
+        - 基础 loss (Charbonnier) 已经很好地监督了低频和中频
+        - FFT Loss 专注于补偿高频细节，与基础 loss 互补而非竞争
+        
+        实现：
+        1. 高通滤波：只保留归一化频率 > 0.25 的高频分量
+        2. 平滑过渡：使用 sigmoid 平滑边界，避免硬截断伪影
+        3. 对数压缩：log(1+amp) 让微弱高频信号可见
         """
-        # 确保张量有4个维度 (B, C, H, W)
         if pred.dim() == 3:
-            pred = pred.unsqueeze(0)  # 添加batch维度
+            pred = pred.unsqueeze(0)
         if target.dim() == 3:
             target = target.unsqueeze(0)
         
-        # 获取当前维度
         B, C, H, W = pred.shape
-        
-        # 临时切换到全精度以支持任意尺寸
         original_dtype = pred.dtype
         pred_fp32 = pred.float()
         target_fp32 = target.float()
         
         try:
-            # 1. 快速傅里叶变换 (Real-to-Complex 2D FFT)
-            # rfft2 专门针对实数输入，输出只保留一半（因为对称），省显存
-            # norm='ortho' 保证能量守恒
-            pred_fft = torch.fft.rfft2(pred_fp32, norm='ortho')
-            target_fft = torch.fft.rfft2(target_fp32, norm='ortho')
-
-            # 2. 提取幅度 (Amplitude)
-            # 我们通常只关心"频率强度"是否一致，相位(Phase)很难对齐且容易导致Loss震荡
-            # abs() 对复数会计算模长 (sqrt(real^2 + imag^2))
-            pred_amp = pred_fft.abs()
-            target_amp = target_fft.abs()
-
-            # 3. 计算 L1 Loss
-            # 频率差异通常用 L1 比 L2 更好，对高频噪声更鲁棒
-            loss = (pred_amp - target_amp).abs().mean()
+            # 1. 2D FFT + shift (零频移到中心)
+            pred_fft = torch.fft.fft2(pred_fp32, norm='ortho')
+            target_fft = torch.fft.fft2(target_fp32, norm='ortho')
+            pred_fft = torch.fft.fftshift(pred_fft, dim=(-2, -1))
+            target_fft = torch.fft.fftshift(target_fft, dim=(-2, -1))
             
-            # 将损失转换回原始数据类型
+            # 2. 构建高通滤波器
+            # 计算归一化频率距离 [0, 1]
+            freq_y = torch.linspace(-0.5, 0.5, H, device=pred.device).view(-1, 1)
+            freq_x = torch.linspace(-0.5, 0.5, W, device=pred.device).view(1, -1)
+            freq_dist = torch.sqrt(freq_y ** 2 + freq_x ** 2)  # [0, ~0.707]
+            freq_dist = freq_dist / 0.707  # 归一化到 [0, 1]
+            
+            # 高通滤波器：只保留高频 (freq > cutoff)
+            # 使用 sigmoid 平滑过渡，避免硬截断
+            # cutoff=0.25 表示只监督最外圈 75% 的高频区域
+            # sharpness=12 控制过渡带宽度
+            cutoff = 0.25
+            sharpness = 12.0
+            highpass_mask = torch.sigmoid((freq_dist - cutoff) * sharpness)
+            highpass_mask = highpass_mask.view(1, 1, H, W)
+            
+            # 3. 提取幅度 + 对数压缩
+            eps = 1e-8
+            pred_amp = torch.log1p(pred_fft.abs() + eps)
+            target_amp = torch.log1p(target_fft.abs() + eps)
+            
+            # 4. 只在高频区域计算 loss
+            diff = (pred_amp - target_amp).abs()
+            masked_diff = diff * highpass_mask
+            
+            # 5. 计算 loss (只对高频区域求均值)
+            # 避免被零填充的低频区域稀释
+            highpass_sum = highpass_mask.sum()
+            if highpass_sum > 0:
+                loss = (masked_diff.sum()) / (highpass_sum * B * C)
+            else:
+                loss = masked_diff.mean()
+            
             return loss.to(original_dtype)
             
         except RuntimeError as e:
-            # 如果FFT失败，返回0损失但不中断训练
-            if "powers of two" in str(e):
+            if "powers of two" in str(e) or "cuFFT" in str(e):
                 logger.debug(f"FFT loss disabled for dimensions {H}x{W}: {e}")
                 return torch.tensor(0.0, device=pred.device, dtype=original_dtype)
             else:
-                # 其他错误重新抛出
                 raise
 
     def verify_setup(self):
