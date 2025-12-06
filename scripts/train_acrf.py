@@ -451,12 +451,14 @@ def main():
         
     # 7. 创建学习率调度器
     from diffusers.optimization import get_scheduler
+    # 注意：warmup_steps 和 training_steps 不需要乘以 gradient_accumulation_steps
+    # 因为 lr_scheduler.step() 只在每个优化器步骤后调用一次
     logger.info(f"[SCHED] 初始化调度器: {args.lr_scheduler} (warmup={args.lr_warmup_steps}, cycles={args.lr_num_cycles})")
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=args.max_train_steps,
         num_cycles=args.lr_num_cycles,
     )
     

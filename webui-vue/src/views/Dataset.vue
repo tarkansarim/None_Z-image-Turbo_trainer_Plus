@@ -575,34 +575,22 @@
     <el-dialog
       v-model="showBucketCalculator"
       title="分桶计算器"
-      width="900px"
+      width="800px"
       class="bucket-dialog"
     >
       <div class="bucket-config">
-        <el-form label-width="100px">
-          <div class="config-row">
-            <el-form-item label="Batch Size">
-              <el-input-number v-model="bucketConfig.batchSize" :min="1" :max="16" />
-            </el-form-item>
-            <el-form-item label="分辨率限制">
-              <el-input-number v-model="bucketConfig.resolutionLimit" :min="256" :max="2048" :step="64" />
-            </el-form-item>
-            <el-form-item>
-              <el-button type="primary" @click="calculateBuckets" :loading="calculatingBuckets">
-                计算分桶
-              </el-button>
-            </el-form-item>
-          </div>
-          <div class="config-row adaptive-row">
-            <el-form-item label="适应性合并">
-              <el-switch v-model="bucketConfig.enableAdaptive" />
-              <span class="switch-hint">启用后会尝试合并相近尺寸的桶以减少丢弃</span>
-            </el-form-item>
-            <el-form-item label="容差像素" v-if="bucketConfig.enableAdaptive">
-              <el-input-number v-model="bucketConfig.tolerance" :min="8" :max="128" :step="8" />
-              <span class="input-hint">允许合并的最大尺寸差异（像素）</span>
-            </el-form-item>
-          </div>
+        <el-form :inline="true" label-width="100px">
+          <el-form-item label="Batch Size">
+            <el-input-number v-model="bucketConfig.batchSize" :min="1" :max="16" />
+          </el-form-item>
+          <el-form-item label="分辨率限制">
+            <el-input-number v-model="bucketConfig.resolutionLimit" :min="256" :max="2048" :step="64" />
+          </el-form-item>
+          <el-form-item>
+            <el-button type="primary" @click="calculateBuckets" :loading="calculatingBuckets">
+              计算分桶
+            </el-button>
+          </el-form-item>
         </el-form>
       </div>
       
@@ -615,7 +603,6 @@
           <div class="summary-item">
             <span class="label">桶数量</span>
             <span class="value">{{ bucketResults.length }}</span>
-            <span class="value-hint" v-if="bucketSummary.mergedBuckets > 0">(-{{ bucketSummary.mergedBuckets }})</span>
           </div>
           <div class="summary-item">
             <span class="label">总批次数</span>
@@ -623,21 +610,19 @@
           </div>
           <div class="summary-item">
             <span class="label">丢弃图片</span>
-            <span class="value" :class="{ 'text-warning': bucketSummary.droppedImages > 0, 'text-success': bucketSummary.droppedImages === 0 }">
+            <span class="value" :class="{ 'text-warning': bucketSummary.droppedImages > 0 }">
               {{ bucketSummary.droppedImages }}
             </span>
-            <span class="value-hint text-success" v-if="bucketSummary.savedImages > 0">(节省 {{ bucketSummary.savedImages }})</span>
           </div>
         </div>
         
-        <el-table :data="bucketResults" style="width: 100%" max-height="350">
-          <el-table-column prop="resolution" label="分辨率" width="130">
+        <el-table :data="bucketResults" style="width: 100%" max-height="400">
+          <el-table-column prop="resolution" label="分辨率" width="120">
             <template #default="{ row }">
-              <span>{{ row.width }}×{{ row.height }}</span>
-              <el-tag v-if="row.merged" type="success" size="small" class="merged-tag">已合并</el-tag>
+              {{ row.width }}×{{ row.height }}
             </template>
           </el-table-column>
-          <el-table-column prop="aspectRatio" label="宽高比" width="80">
+          <el-table-column prop="aspectRatio" label="宽高比" width="100">
             <template #default="{ row }">
               {{ row.aspectRatio.toFixed(2) }}
             </template>
@@ -649,47 +634,17 @@
               <span :class="{ 'text-warning': row.dropped > 0 }">{{ row.dropped }}</span>
             </template>
           </el-table-column>
-          <el-table-column label="裁剪建议" width="120" v-if="bucketConfig.enableAdaptive">
-            <template #default="{ row }">
-              <span v-if="row.cropSuggestion" class="crop-hint">{{ row.cropSuggestion }}</span>
-              <span v-else class="no-crop">-</span>
-            </template>
-          </el-table-column>
-          <el-table-column label="分布" min-width="150">
+          <el-table-column label="分布" min-width="200">
             <template #default="{ row }">
               <el-progress 
                 :percentage="row.percentage" 
-                :stroke-width="10"
+                :stroke-width="12"
                 :show-text="false"
                 :color="getBucketColor(row.aspectRatio)"
               />
             </template>
           </el-table-column>
         </el-table>
-        
-        <div class="bucket-tips" v-if="bucketConfig.enableAdaptive && bucketSummary.savedImages > 0">
-          <el-icon><InfoFilled /></el-icon>
-          <span>适应性合并通过微调图片尺寸（最多 ±{{ bucketConfig.tolerance }}px）将零散的小桶合并到大桶中，有效减少训练时的图片丢弃。</span>
-        </div>
-        
-        <!-- 裁剪进度 -->
-        <div class="crop-progress" v-if="adaptiveCropState.running || adaptiveCropState.completed > 0">
-          <div class="progress-header">
-            <span>裁剪进度</span>
-            <span class="progress-text">{{ adaptiveCropState.completed }}/{{ adaptiveCropState.total }}</span>
-          </div>
-          <el-progress 
-            :percentage="adaptiveCropState.total > 0 ? Math.round(adaptiveCropState.completed / adaptiveCropState.total * 100) : 0"
-            :status="adaptiveCropState.running ? undefined : 'success'"
-          />
-          <div class="progress-detail" v-if="adaptiveCropState.current_file">
-            正在处理: {{ adaptiveCropState.current_file }}
-          </div>
-          <div class="progress-stats" v-if="!adaptiveCropState.running && adaptiveCropState.completed > 0">
-            <el-tag type="success" size="small">已裁剪 {{ adaptiveCropState.cropped }}</el-tag>
-            <el-tag type="info" size="small" v-if="adaptiveCropState.skipped > 0">跳过 {{ adaptiveCropState.skipped }}</el-tag>
-          </div>
-        </div>
       </div>
       
       <div class="bucket-empty" v-else-if="!calculatingBuckets">
@@ -698,26 +653,7 @@
       </div>
       
       <template #footer>
-        <div class="dialog-footer">
-          <el-button @click="showBucketCalculator = false">关闭</el-button>
-          <el-button 
-            v-if="bucketConfig.enableAdaptive && bucketSummary.savedImages > 0"
-            type="primary"
-            :loading="adaptiveCropState.running"
-            :disabled="adaptiveCropState.running"
-            @click="applyAdaptiveCrop"
-          >
-            <el-icon v-if="!adaptiveCropState.running"><Scissor /></el-icon>
-            {{ adaptiveCropState.running ? '裁剪中...' : '应用适应性裁剪' }}
-          </el-button>
-          <el-button 
-            v-if="adaptiveCropState.running"
-            type="danger"
-            @click="stopAdaptiveCrop"
-          >
-            停止
-          </el-button>
-        </div>
+        <el-button @click="showBucketCalculator = false">关闭</el-button>
       </template>
     </el-dialog>
   </div>
@@ -729,7 +665,7 @@ import { useDatasetStore, type DatasetImage } from '@/stores/dataset'
 import { useTrainingStore } from '@/stores/training'
 import { useWebSocketStore } from '@/stores/websocket'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Delete, InfoFilled, WarningFilled, MagicStick, ScaleToOriginal, Loading, Clock, Grid, Scissor } from '@element-plus/icons-vue'
+import { Delete, InfoFilled, WarningFilled, MagicStick, ScaleToOriginal, Loading, Clock, Grid } from '@element-plus/icons-vue'
 import axios from 'axios'
 
 const datasetStore = useDatasetStore()
@@ -798,9 +734,7 @@ const showBucketCalculator = ref(false)
 const calculatingBuckets = ref(false)
 const bucketConfig = ref({
   batchSize: 4,
-  resolutionLimit: 1536,
-  enableAdaptive: true,
-  tolerance: 32  // 允许合并的最大尺寸差异
+  resolutionLimit: 1536
 })
 interface BucketInfo {
   width: number
@@ -810,110 +744,17 @@ interface BucketInfo {
   batches: number
   dropped: number
   percentage: number
-  merged?: boolean
-  cropSuggestion?: string
-  originalCount?: number
 }
 const bucketResults = ref<BucketInfo[]>([])
-const originalDropped = ref(0)  // 记录未优化时的丢弃数
-
 const bucketSummary = computed(() => {
   const totalImages = bucketResults.value.reduce((sum, b) => sum + b.count, 0)
   const totalBatches = bucketResults.value.reduce((sum, b) => sum + b.batches, 0)
   const droppedImages = bucketResults.value.reduce((sum, b) => sum + b.dropped, 0)
-  const mergedBuckets = bucketResults.value.filter(b => b.merged).length
-  const savedImages = Math.max(0, originalDropped.value - droppedImages)
-  return { totalImages, totalBatches, droppedImages, mergedBuckets, savedImages }
+  return { totalImages, totalBatches, droppedImages }
 })
-
-// 适应性裁剪状态
-const adaptiveCropState = ref({
-  running: false,
-  total: 0,
-  completed: 0,
-  current_file: '',
-  cropped: 0,
-  skipped: 0
-})
-
-let cropPollTimer: number | null = null
-
-async function applyAdaptiveCrop() {
-  if (!currentView.value) return
-  
-  try {
-    await ElMessageBox.confirm(
-      '适应性裁剪将修改原始图片文件（居中裁剪），此操作不可撤销。\n\n裁剪完成后需要重新生成 Latent 缓存才能在训练中生效。\n\n确定要继续吗？',
-      '确认裁剪',
-      { confirmButtonText: '开始裁剪', cancelButtonText: '取消', type: 'warning' }
-    )
-  } catch {
-    return
-  }
-  
-  try {
-    const res = await axios.post('/api/dataset/adaptive-crop', {
-      dataset_path: currentView.value,
-      resolution_limit: bucketConfig.value.resolutionLimit,
-      batch_size: bucketConfig.value.batchSize,
-      tolerance: bucketConfig.value.tolerance
-    })
-    
-    if (res.data.total === 0) {
-      ElMessage.info(res.data.message)
-      return
-    }
-    
-    ElMessage.success(`开始裁剪 ${res.data.total} 张图片`)
-    adaptiveCropState.value.running = true
-    startCropPolling()
-    
-  } catch (error: any) {
-    ElMessage.error('启动裁剪失败: ' + (error.response?.data?.detail || error.message))
-  }
-}
-
-function startCropPolling() {
-  if (cropPollTimer) clearInterval(cropPollTimer)
-  
-  cropPollTimer = window.setInterval(async () => {
-    try {
-      const res = await axios.get('/api/dataset/adaptive-crop/status')
-      adaptiveCropState.value = res.data
-      
-      if (!res.data.running) {
-        stopCropPolling()
-        if (res.data.cropped > 0) {
-          ElMessage.success(`裁剪完成！已处理 ${res.data.cropped} 张图片。请重新生成 Latent 缓存。`)
-          // 刷新数据集
-          await datasetStore.scanDataset(currentView.value!)
-        }
-      }
-    } catch {
-      stopCropPolling()
-    }
-  }, 500)
-}
-
-function stopCropPolling() {
-  if (cropPollTimer) {
-    clearInterval(cropPollTimer)
-    cropPollTimer = null
-  }
-}
-
-async function stopAdaptiveCrop() {
-  try {
-    await axios.post('/api/dataset/adaptive-crop/stop')
-    adaptiveCropState.value.running = false
-    stopCropPolling()
-    ElMessage.info('已停止裁剪')
-  } catch (error: any) {
-    ElMessage.error('停止失败')
-  }
-}
 
 function getBucketColor(aspectRatio: number): string {
+  // 根据宽高比返回颜色
   if (aspectRatio < 0.8) return '#67c23a' // 竖图 - 绿色
   if (aspectRatio > 1.2) return '#409eff' // 横图 - 蓝色
   return '#f0b429' // 方图 - 金色
@@ -924,129 +765,45 @@ async function calculateBuckets() {
   
   calculatingBuckets.value = true
   bucketResults.value = []
-  originalDropped.value = 0
   
   try {
+    // 从当前图片列表计算分桶
     const images = datasetStore.currentImages
     const limit = bucketConfig.value.resolutionLimit
     const batchSize = bucketConfig.value.batchSize
-    const tolerance = bucketConfig.value.tolerance
-    const enableAdaptive = bucketConfig.value.enableAdaptive
     
-    // 第一步：按原始分辨率分组
-    interface RawBucket {
-      width: number
-      height: number
-      count: number
-      images: Array<{w: number, h: number}>
-    }
-    const rawBuckets: Record<string, RawBucket> = {}
+    // 按分辨率分组
+    const buckets: Record<string, { width: number; height: number; count: number }> = {}
     
     for (const img of images) {
       let w = img.width
       let h = img.height
       
+      // 应用分辨率限制
       if (Math.max(w, h) > limit) {
         const scale = limit / Math.max(w, h)
         w = Math.floor(w * scale)
         h = Math.floor(h * scale)
       }
       
+      // 对齐到 8 的倍数
       w = Math.floor(w / 8) * 8
       h = Math.floor(h / 8) * 8
       
       const key = `${w}x${h}`
-      if (!rawBuckets[key]) {
-        rawBuckets[key] = { width: w, height: h, count: 0, images: [] }
+      if (!buckets[key]) {
+        buckets[key] = { width: w, height: h, count: 0 }
       }
-      rawBuckets[key].count++
-      rawBuckets[key].images.push({w, h})
+      buckets[key].count++
     }
     
-    // 计算未优化时的丢弃数
-    for (const bucket of Object.values(rawBuckets)) {
-      const batches = Math.floor(bucket.count / batchSize)
-      originalDropped.value += batches > 0 ? bucket.count % batchSize : bucket.count
-    }
-    
-    // 第二步：如果启用适应性合并，尝试合并相近的桶
-    let finalBuckets = { ...rawBuckets }
-    const mergeInfo: Record<string, {target: string, crop: string}> = {}
-    
-    if (enableAdaptive) {
-      // 按数量排序，大桶优先
-      const sortedKeys = Object.keys(rawBuckets).sort((a, b) => rawBuckets[b].count - rawBuckets[a].count)
-      const merged = new Set<string>()
-      
-      for (const srcKey of sortedKeys) {
-        if (merged.has(srcKey)) continue
-        
-        const srcBucket = rawBuckets[srcKey]
-        const srcBatches = Math.floor(srcBucket.count / batchSize)
-        const srcRemainder = srcBucket.count % batchSize
-        
-        // 只处理有余数且余数不能单独成批的桶
-        if (srcRemainder === 0 || srcBatches === 0) continue
-        
-        // 寻找可以合并的目标桶
-        for (const dstKey of sortedKeys) {
-          if (srcKey === dstKey || merged.has(dstKey)) continue
-          
-          const dstBucket = rawBuckets[dstKey]
-          const dstBatches = Math.floor(dstBucket.count / batchSize)
-          
-          // 目标桶必须有完整批次
-          if (dstBatches === 0) continue
-          
-          // 检查尺寸差异是否在容差范围内
-          const wDiff = Math.abs(srcBucket.width - dstBucket.width)
-          const hDiff = Math.abs(srcBucket.height - dstBucket.height)
-          
-          if (wDiff <= tolerance && hDiff <= tolerance) {
-            // 检查宽高比差异不能太大（防止严重变形）
-            const srcRatio = srcBucket.width / srcBucket.height
-            const dstRatio = dstBucket.width / dstBucket.height
-            if (Math.abs(srcRatio - dstRatio) > 0.1) continue
-            
-            // 合并：将源桶的余数图片移到目标桶
-            const newDstCount = dstBucket.count + srcRemainder
-            const newSrcCount = srcBucket.count - srcRemainder
-            
-            // 检查合并后是否真的减少了丢弃
-            const oldDropped = (srcRemainder) + (dstBucket.count % batchSize)
-            const newDropped = (newDstCount % batchSize) + (newSrcCount > 0 ? newSrcCount % batchSize : 0)
-            
-            if (newDropped < oldDropped) {
-              // 执行合并
-              finalBuckets[dstKey] = { ...dstBucket, count: newDstCount }
-              if (newSrcCount > 0) {
-                finalBuckets[srcKey] = { ...srcBucket, count: newSrcCount }
-              } else {
-                delete finalBuckets[srcKey]
-                merged.add(srcKey)
-              }
-              
-              // 记录合并信息
-              const cropW = dstBucket.width - srcBucket.width
-              const cropH = dstBucket.height - srcBucket.height
-              const cropStr = `${cropW >= 0 ? '+' : ''}${cropW}, ${cropH >= 0 ? '+' : ''}${cropH}`
-              mergeInfo[srcKey] = { target: dstKey, crop: cropStr }
-              
-              break
-            }
-          }
-        }
-      }
-    }
-    
-    // 第三步：生成结果
+    // 计算每个桶的批次数和丢弃数
     const results: BucketInfo[] = []
-    const maxCount = Math.max(...Object.values(finalBuckets).map(b => b.count))
+    const maxCount = Math.max(...Object.values(buckets).map(b => b.count))
     
-    for (const [key, bucket] of Object.entries(finalBuckets)) {
+    for (const [key, bucket] of Object.entries(buckets)) {
       const batches = Math.floor(bucket.count / batchSize)
       const dropped = bucket.count % batchSize
-      const isMerged = mergeInfo[key] !== undefined
       
       results.push({
         width: bucket.width,
@@ -1054,14 +811,12 @@ async function calculateBuckets() {
         aspectRatio: bucket.width / bucket.height,
         count: bucket.count,
         batches,
-        dropped: batches > 0 ? dropped : bucket.count,
-        percentage: Math.round((bucket.count / maxCount) * 100),
-        merged: isMerged,
-        cropSuggestion: isMerged ? mergeInfo[key].crop : undefined,
-        originalCount: rawBuckets[key]?.count
+        dropped: batches > 0 ? dropped : bucket.count, // 如果没有完整批次，全部丢弃
+        percentage: Math.round((bucket.count / maxCount) * 100)
       })
     }
     
+    // 按图片数量排序
     results.sort((a, b) => b.count - a.count)
     bucketResults.value = results
     
@@ -2611,41 +2366,12 @@ function formatSize(bytes: number): string {
     padding: 16px;
     background: var(--bg-hover);
     border-radius: var(--radius-md);
-    
-    .config-row {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-      flex-wrap: wrap;
-      
-      .el-form-item {
-        margin-bottom: 0;
-      }
-    }
-    
-    .adaptive-row {
-      margin-top: 16px;
-      padding-top: 16px;
-      border-top: 1px solid var(--border-color);
-    }
-    
-    .switch-hint {
-      margin-left: 8px;
-      font-size: 12px;
-      color: var(--text-muted);
-    }
-    
-    .input-hint {
-      margin-left: 8px;
-      font-size: 11px;
-      color: var(--text-muted);
-    }
   }
   
   .bucket-summary {
     display: flex;
     gap: 24px;
-    margin-bottom: 16px;
+    margin-bottom: 20px;
     padding: 16px;
     background: var(--bg-card);
     border-radius: var(--radius-md);
@@ -2669,20 +2395,6 @@ function formatSize(bytes: number): string {
         &.text-warning {
           color: var(--warning);
         }
-        
-        &.text-success {
-          color: var(--success);
-        }
-      }
-      
-      .value-hint {
-        font-size: 12px;
-        font-weight: normal;
-        margin-left: 4px;
-        
-        &.text-success {
-          color: var(--success);
-        }
       }
     }
   }
@@ -2692,86 +2404,6 @@ function formatSize(bytes: number): string {
       color: var(--warning);
       font-weight: bold;
     }
-    
-    .text-success {
-      color: var(--success);
-    }
-    
-    .merged-tag {
-      margin-left: 6px;
-      font-size: 10px;
-    }
-    
-    .crop-hint {
-      font-size: 11px;
-      color: var(--text-muted);
-      font-family: var(--font-mono);
-    }
-    
-    .no-crop {
-      color: var(--text-muted);
-      opacity: 0.5;
-    }
-  }
-  
-  .bucket-tips {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    margin-top: 16px;
-    padding: 12px 16px;
-    background: rgba(103, 194, 58, 0.1);
-    border-radius: var(--radius-md);
-    font-size: 12px;
-    color: var(--text-secondary);
-    
-    .el-icon {
-      color: var(--success);
-      flex-shrink: 0;
-      margin-top: 2px;
-    }
-  }
-  
-  .crop-progress {
-    margin-top: 16px;
-    padding: 16px;
-    background: var(--bg-card);
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border-color);
-    
-    .progress-header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      margin-bottom: 8px;
-      font-size: 13px;
-      
-      .progress-text {
-        color: var(--text-muted);
-        font-family: var(--font-mono);
-      }
-    }
-    
-    .progress-detail {
-      margin-top: 8px;
-      font-size: 12px;
-      color: var(--text-muted);
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    
-    .progress-stats {
-      display: flex;
-      gap: 8px;
-      margin-top: 12px;
-    }
-  }
-  
-  .dialog-footer {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
   }
   
   .bucket-empty {
