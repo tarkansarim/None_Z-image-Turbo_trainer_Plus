@@ -19,6 +19,7 @@
 | 🎯 **锚点耦合采样** | 只在关键时间步训练，高效稳定 |
 | ⚡ **10步快速推理** | 保持 Turbo 模型的加速结构 |
 | 📉 **Min-SNR 加权** | 减少不同时间步的 loss 波动 |
+| 🎨 **多种损失模式** | 频域感知 / 风格结构 / 统一模式 |
 | 🔧 **自动硬件优化** | 检测 GPU 并自动配置 (Tier S/A/B) |
 | 🖥️ **现代化 WebUI** | Vue.js + FastAPI 全栈界面 |
 | 📊 **实时监控** | Loss 曲线、进度、显存监控 |
@@ -178,17 +179,27 @@ python -m zimage_trainer.cache_text_encoder \
 ### 启动训练
 
 ```bash
-# 使用配置文件训练
+# 使用配置文件训练（推荐）
 python scripts/train_acrf.py --config config/acrf_config.toml
 
-# 或直接指定参数
-python scripts/train_acrf.py \
-    --model_path ./zimage_models \
-    --dataset_path ./datasets/your_dataset \
-    --output_dir ./output \
-    --network_dim 16 \
-    --learning_rate 1e-4 \
-    --num_train_epochs 10
+# 指定损失模式
+python scripts/train_acrf.py --config config/acrf_config.toml --loss_mode frequency
+
+# 频域感知模式 + 自定义参数
+python scripts/train_acrf.py --config config/acrf_config.toml \
+    --loss_mode frequency \
+    --alpha_hf 1.0 \
+    --beta_lf 0.2
+
+# 风格结构模式
+python scripts/train_acrf.py --config config/acrf_config.toml \
+    --loss_mode style \
+    --lambda_struct 1.0 \
+    --lambda_light 0.5 \
+    --lambda_color 0.3
+
+# 统一模式（频域 + 风格）
+python scripts/train_acrf.py --config config/acrf_config.toml --loss_mode unified
 ```
 
 ### 推理生成
@@ -265,11 +276,65 @@ network_alpha = 16      # LoRA alpha
 learning_rate = 1e-4    # 学习率
 num_train_epochs = 10   # 训练轮数
 snr_gamma = 5.0         # Min-SNR 加权
-lambda_fft = 0          # FFT 频域 loss 权重
-lambda_cosine = 0       # Cosine 相似度 loss 权重
+loss_mode = "standard"  # 损失模式（见下方说明）
 ```
 
-> ⚠️ **警告**: `lambda_fft` 和 `lambda_cosine` 是实验性的混合 loss 参数。**如果你不了解它们的作用，请保持为 0，不要开启！** 错误的设置可能导致训练不稳定或效果变差。
+### 🎨 损失模式 (Loss Mode)
+
+新版本支持 4 种损失模式，可在前端"高级选项"中选择：
+
+| 模式 | 说明 | 适用场景 | 推荐参数 |
+|------|------|----------|----------|
+| **standard** | 基础 MSE + 可选 FFT/Cosine | 通用训练 | 默认即可 |
+| **frequency** | 频域感知（高频L1 + 低频Cosine） | 锐化细节，不改风格 | alpha_hf=1.0, beta_lf=0.2 |
+| **style** | 风格结构（SSIM + Lab统计量） | 学习大师光影/调色 | lambda_struct=1.0 |
+| **unified** | 频域 + 风格 组合 | 全面增强 | 两者默认值 |
+
+#### 频域感知模式 (frequency)
+
+```
+核心原理：
+┌─────────────────────────────────────────┐
+│  Latent ──► 降采样 ──► 低频（结构）     │
+│         └──► 高频 = 原始 - 低频（细节） │
+│                                         │
+│  Loss = MSE + α·L1(高频) + β·Cos(低频)  │
+└─────────────────────────────────────────┘
+
+参数说明：
+- alpha_hf: 高频增强权重（↑锐化 ↑噪点风险）推荐 0.5~1.0
+- beta_lf:  低频锁定权重（↑保持结构）推荐 0.1~0.3
+```
+
+#### 风格结构模式 (style)
+
+```
+核心原理：
+┌─────────────────────────────────────────────┐
+│  Latent 近似 Lab 空间                        │
+│  ├─ L通道 ──► SSIM（锁结构）                │
+│  │         ├─ Mean/Std（学光影）            │
+│  │         └─ 高频L1（学纹理）              │
+│  └─ ab通道 ──► Mean/Std（学色调）           │
+└─────────────────────────────────────────────┘
+
+参数说明：
+- lambda_struct: 结构锁（防脸崩）推荐 0.5~1.0
+- lambda_light:  光影学习（学S曲线）推荐 0.3~0.8
+- lambda_color:  色调迁移（学冷暖调）推荐 0.2~0.5
+- lambda_tex:    质感增强（学颗粒感）推荐 0.3~0.5
+```
+
+#### 选择建议
+
+| 你的目标 | 推荐模式 |
+|----------|----------|
+| 训练人物/角色 LoRA | `standard` |
+| 提升画面清晰度 | `frequency` |
+| 学习特定摄影师风格 | `style` |
+| 全面提升质量 | `unified` |
+
+> 💡 **新手建议**：先用 `standard` 模式训练，效果不满意再尝试其他模式。
 
 ### 硬件分级
 
