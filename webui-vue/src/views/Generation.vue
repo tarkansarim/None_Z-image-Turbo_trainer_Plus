@@ -419,7 +419,10 @@ const generateImage = async () => {
   generating.value = true
   
   try {
-    const res = await axios.post('/api/generate', params.value)
+    // 生成可能需要较长时间（模型加载+推理），设置 5 分钟超时
+    const res = await axios.post('/api/generate', params.value, {
+      timeout: 5 * 60 * 1000  // 5 minutes
+    })
     if (res.data.success) {
       resultImage.value = res.data.image
       resultSeed.value = res.data.seed
@@ -431,7 +434,11 @@ const generateImage = async () => {
     }
   } catch (e: any) {
     console.error('Generation error:', e)
-    ElMessage.error('生成失败: ' + (e.response?.data?.detail || e.message))
+    if (e.code === 'ECONNABORTED') {
+      ElMessage.error('生成超时，请检查后台是否正常运行')
+    } else {
+      ElMessage.error('生成失败: ' + (e.response?.data?.detail || e.message))
+    }
   } finally {
     generating.value = false
   }
