@@ -542,20 +542,12 @@ def generate_caption_ollama_sync(img_path: Path, ollama_url: str, model: str, pr
             caption = data["response"].strip()
             print(f"[Ollama] Raw response ({len(caption)} chars): {caption[:200] if caption else '(empty)'}...")
         
-        # 如果 response 为空，检查 thinking 字段（某些模型如 qwen3-vl 会把结果放这里）
-        if not caption and "thinking" in data:
-            thinking_content = data["thinking"]
-            if thinking_content:
-                print(f"[Ollama] Found thinking field ({len(thinking_content)} chars)")
-                # 尝试从 thinking 中提取最后的结论
-                # 通常思考结束后会有总结
-                lines = thinking_content.strip().split('\n')
-                # 取最后几行非空内容作为 caption
-                non_empty_lines = [l.strip() for l in lines if l.strip() and not l.strip().startswith(('好的', '让我', '我需要', '首先', '然后', '接下来', '我来'))]
-                if non_empty_lines:
-                    # 取最后一段作为描述
-                    caption = non_empty_lines[-1] if len(non_empty_lines[-1]) > 20 else '\n'.join(non_empty_lines[-3:])
-                    print(f"[Ollama] Extracted from thinking: {caption[:100]}...")
+        # 如果 response 为空但有 thinking 字段，说明模型启用了思考模式但没输出结果
+        if not caption and "thinking" in data and data["thinking"]:
+            print(f"[Ollama] Warning: Model returned thinking but no response!")
+            print(f"[Ollama] Thinking content ({len(data['thinking'])} chars): {data['thinking'][:200]}...")
+            print(f"[Ollama] Tip: 请在前端关闭「启用思考模式」，或使用 /no_think 前缀")
+            return None
         
         if caption:
             # 清理输出
