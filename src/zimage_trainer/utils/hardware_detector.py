@@ -293,29 +293,32 @@ class HardwareDetector:
             })
             
         elif gpu_tier == 'tier_b':
-            # Tier B (16GB级: 4080/4070TiS): 平衡模式
-            # 16GB 跑 LoRA 仍然足够，但需要更保守的配置
+            # Tier B (16GB级: 4080/4070TiS/P100): 精简模式
+            # 16GB 跑 LoRA 足够，但需要精简配置，避免不必要的内存开销
             optimized.update({
-                # ⚠️ 16GB 可能需要轻度 Block Swap，但阈值不要太极端
-                'block_swap_enabled': True,
-                'block_swap_block_size': 512, 
-                'block_swap_cpu_buffer_size': 2048, 
-                'block_swap_swap_threshold': 0.85,  # 85% 阈值，留一些缓冲
-                'block_swap_prefetch_size': 128,
-                'block_swap_swap_in_batch': 4,
-                'block_swap_max_cache_blocks': int(memory_gb * 50), 
-                'block_swap_prefetch_stream_count': 2,
+                # ❌ 关闭 Block Swap - 16GB LoRA 训练不需要，开启反而可能卡死
+                # Block Swap 的监控线程和内存交换在边界条件下可能导致死锁
+                'block_swap_enabled': False,
+                'block_swap_block_size': 0,
+                'block_swap_cpu_buffer_size': 0,
+                'block_swap_swap_threshold': 0,
                 
                 # ❌ 关闭 SPDA - 单卡无意义
                 'spda_enabled': False,
                 
-                # ✅ 使用原生 SDPA
+                # ✅ 使用原生 SDPA (内存效率最高)
                 'sdpa_enabled': True,
                 'sdpa_flash_attention': True,
                 'attention_backend': 'sdpa',
                 
-                # max_grad_norm 由用户在 toml 中指定，不自动覆盖
-                'dataloader_num_workers': 4,
+                # ✅ 强制启用梯度检查点 - 16GB 必须开启
+                'gradient_checkpointing': True,
+                
+                # ✅ 减少数据加载器线程数 - 节省 CPU 内存，避免与 GPU 竞争
+                'dataloader_num_workers': 2,
+                
+                # ✅ 增加梯度累积 - 减少单次显存峰值
+                'gradient_accumulation_steps': 4,
                 
                 # xformers 作为备选
                 'xformers_enabled': self.xformers_info.get('available', False),

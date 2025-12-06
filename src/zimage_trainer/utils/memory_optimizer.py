@@ -424,9 +424,11 @@ class MemoryOptimizer:
     
     def start(self):
         """启动内存优化器"""
-        if self.enabled:
+        if self.enabled and self.config.get('block_swap_enabled', False):
             self.block_swap.start_monitoring()
             logger.info("💾 块交换内存优化器已启动")
+        else:
+            logger.info("💾 内存优化器已就绪（Block Swap 已禁用）")
     
     def stop(self):
         """停止内存优化器"""
@@ -439,17 +441,26 @@ class MemoryOptimizer:
         if not self.enabled:
             return
         
-        # 仅在内存极度紧张时清理缓存 (例如 > 95%)
-        # 频繁清理会严重影响性能
+        # 根据显存大小调整清理阈值
+        # 16GB 及以下显卡需要更积极的清理
         if torch.cuda.is_available():
-            usage = torch.cuda.memory_allocated(0) / torch.cuda.get_device_properties(0).total_memory
-            if usage > 0.98:
+            total_memory = torch.cuda.get_device_properties(0).total_memory
+            total_gb = total_memory / (1024**3)
+            allocated = torch.cuda.memory_allocated(0)
+            usage = allocated / total_memory
+            
+            # 16GB 及以下: 90% 时开始清理
+            # 24GB+: 95% 时清理
+            threshold = 0.90 if total_gb < 20 else 0.95
+            
+            if usage > threshold:
                 torch.cuda.empty_cache()
                 gc.collect()
         
-        # 收集统计信息
-        stats = self.block_swap.get_memory_stats()
-        self._update_performance_stats(stats)
+        # 只有启用了 block_swap 才收集统计
+        if self.config.get('block_swap_enabled', False):
+            stats = self.block_swap.get_memory_stats()
+            self._update_performance_stats(stats)
     
     def _update_performance_stats(self, stats: Dict[str, Any]):
         """更新性能统计"""
