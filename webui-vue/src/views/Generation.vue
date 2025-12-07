@@ -211,7 +211,35 @@
         </div>
         
         <div class="history-grid" v-loading="loadingHistory">
-          <div v-if="historyList.length === 0" class="empty-history">
+          <!-- 进行中/已中断的任务 -->
+          <div v-if="pendingTask" class="history-card glass-card pending-task-card" :class="{ 'interrupted': pendingTask.interrupted }">
+            <div class="history-thumb-wrapper pending-thumb">
+              <div class="pending-overlay">
+                <template v-if="!pendingTask.interrupted">
+                  <el-icon class="spinning pending-icon"><Loading /></el-icon>
+                  <span class="pending-text">生成中...</span>
+                </template>
+                <template v-else>
+                  <el-icon class="pending-icon interrupted-icon"><WarningFilled /></el-icon>
+                  <span class="pending-text">已中断</span>
+                </template>
+              </div>
+            </div>
+            <div class="history-info">
+              <div class="history-prompt" :title="pendingTask.prompt">{{ pendingTask.prompt }}</div>
+              <div class="history-meta">
+                <span>{{ pendingTask.width }}x{{ pendingTask.height }}</span>
+                <el-button v-if="pendingTask.interrupted" type="primary" size="small" @click.stop="retryPendingTask">
+                  重新生成
+                </el-button>
+                <el-button v-if="pendingTask.interrupted" type="info" size="small" @click.stop="clearPendingTask">
+                  取消
+                </el-button>
+              </div>
+            </div>
+          </div>
+          
+          <div v-if="historyList.length === 0 && !pendingTask" class="empty-history">
             暂无历史记录
           </div>
           <div 
@@ -322,7 +350,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, reactive, watch } from 'vue'
-import { MagicStick, Download, Picture, Refresh, Clock, Plus, Minus, ZoomIn, Close, Delete, Operation, Loading } from '@element-plus/icons-vue'
+import { MagicStick, Download, Picture, Refresh, Clock, Plus, Minus, ZoomIn, Close, Delete, Operation, Loading, WarningFilled } from '@element-plus/icons-vue'
 import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useWebSocketStore } from '@/stores/websocket'
@@ -332,6 +360,7 @@ const wsStore = useWebSocketStore()
 // localStorage keys
 const STORAGE_KEY_PARAMS = 'generation_params'
 const STORAGE_KEY_RESULT = 'generation_result'
+const STORAGE_KEY_PENDING = 'generation_pending'
 
 // 从 localStorage 加载保存的参数
 const loadSavedParams = () => {
@@ -388,6 +417,78 @@ watch(params, (newParams) => {
     console.warn('Failed to save params:', e)
   }
 }, { deep: true })
+
+// Pending task state
+interface PendingTask {
+  prompt: string
+  width: number
+  height: number
+  steps: number
+  seed: number
+  startTime: number
+  interrupted: boolean
+}
+
+const pendingTask = ref<PendingTask | null>(null)
+
+// 检查是否有被中断的任务
+const checkPendingTask = () => {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY_PENDING)
+    if (saved) {
+      const task = JSON.parse(saved)
+      // 如果页面刚加载，说明之前的任务被中断了
+      task.interrupted = true
+      pendingTask.value = task
+    }
+  } catch (e) {
+    console.warn('Failed to load pending task:', e)
+  }
+}
+
+// 保存 pending task
+const savePendingTask = () => {
+  const task: PendingTask = {
+    prompt: params.value.prompt,
+    width: params.value.width,
+    height: params.value.height,
+    steps: params.value.steps,
+    seed: params.value.seed,
+    startTime: Date.now(),
+    interrupted: false
+  }
+  pendingTask.value = task
+  try {
+    localStorage.setItem(STORAGE_KEY_PENDING, JSON.stringify(task))
+  } catch (e) {
+    console.warn('Failed to save pending task:', e)
+  }
+}
+
+// 清除 pending task
+const clearPendingTask = () => {
+  pendingTask.value = null
+  try {
+    localStorage.removeItem(STORAGE_KEY_PENDING)
+  } catch (e) {
+    console.warn('Failed to clear pending task:', e)
+  }
+}
+
+// 重试被中断的任务
+const retryPendingTask = () => {
+  if (pendingTask.value) {
+    // 恢复参数
+    params.value.prompt = pendingTask.value.prompt
+    params.value.width = pendingTask.value.width
+    params.value.height = pendingTask.value.height
+    params.value.steps = pendingTask.value.steps
+    params.value.seed = pendingTask.value.seed
+    clearPendingTask()
+    // 重新生成
+    generateImage()
+  }
+}
 
 
 // History state
@@ -460,6 +561,7 @@ const generateImage = async () => {
   }
   
   generating.value = true
+  savePendingTask() // 保存任务状态
   
   try {
     // 生成可能需要较长时间（模型加载+推理），设置 5 分钟超时
@@ -493,6 +595,7 @@ const generateImage = async () => {
     }
   } finally {
     generating.value = false
+    clearPendingTask() // 清除任务状态
   }
 }
 
@@ -653,6 +756,7 @@ const zoomOut = (target: 'main' | 'lightbox') => {
 onMounted(() => {
   fetchHistory()
   fetchLoras()
+  checkPendingTask() // 检查是否有被中断的任务
 })
 </script>
 
@@ -1071,9 +1175,61 @@ onMounted(() => {
 .history-meta {
   display: flex;
   justify-content: space-between;
+  align-items: center;
   font-size: 11px;
   color: var(--el-text-color-secondary);
   font-family: monospace;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* Pending Task Card Styles */
+.pending-task-card {
+  border: 2px solid var(--el-color-primary);
+  animation: pulse-border 2s infinite;
+}
+
+.pending-task-card.interrupted {
+  border-color: var(--el-color-warning);
+  animation: none;
+}
+
+@keyframes pulse-border {
+  0%, 100% { border-color: var(--el-color-primary); }
+  50% { border-color: var(--el-color-primary-light-3); }
+}
+
+.pending-thumb {
+  background: linear-gradient(135deg, var(--el-bg-color-page), var(--el-bg-color));
+}
+
+.pending-overlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: rgba(0, 0, 0, 0.3);
+}
+
+.pending-icon {
+  font-size: 48px;
+  color: var(--el-color-primary);
+}
+
+.interrupted-icon {
+  color: var(--el-color-warning);
+}
+
+.pending-text {
+  font-size: 14px;
+  color: var(--el-text-color-primary);
+  font-weight: 500;
 }
 
 .empty-history {
