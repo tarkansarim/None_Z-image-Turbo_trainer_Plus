@@ -232,3 +232,4 @@ def create_degradation_transform(
     
     return ImageDegradation(**presets[strength])
 
+

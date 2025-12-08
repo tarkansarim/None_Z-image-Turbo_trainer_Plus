@@ -610,14 +610,14 @@ def main():
                 
                 if loss_mode == 'standard':
                     # 标准模式：使用 AC-RF 原生损失（内部也会应用 SNR 加权）
-                    loss = acrf_trainer.compute_loss(
-                        model_output=model_pred,
-                        target_velocity=target_velocity,
-                        latents_noisy=noisy_latents,
-                        timesteps=timesteps,
+                loss = acrf_trainer.compute_loss(
+                    model_output=model_pred,
+                    target_velocity=target_velocity,
+                    latents_noisy=noisy_latents,
+                    timesteps=timesteps,
                         target_x0=latents,
-                        lambda_fft=args.lambda_fft,
-                        lambda_cosine=args.lambda_cosine,
+                    lambda_fft=args.lambda_fft,
+                    lambda_cosine=args.lambda_cosine,
                         snr_gamma=snr_gamma,
                         snr_floor=snr_floor,
                     )

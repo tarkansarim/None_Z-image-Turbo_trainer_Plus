@@ -606,7 +606,7 @@
             </el-button>
           </el-form-item>
         </el-form>
-      </div>
+  </div>
       
       <div class="bucket-results" v-if="bucketResults.length > 0">
         <div class="bucket-summary">
@@ -972,7 +972,7 @@ async function saveCaption() {
   
   isSavingCaption.value = true
   try {
-    await datasetStore.updateCaption(editingImage.value.path, editingCaption.value)
+    await datasetStore.saveCaption(editingImage.value.path, editingCaption.value)
     ElMessage.success('标注已保存')
     // previewDialogVisible.value = false // Optional: keep open to continue editing? User usually prefers staying or closing manually. Let's keep it open for now as per "Editor" feel.
   } catch (error) {

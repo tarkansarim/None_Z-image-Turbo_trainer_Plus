@@ -411,7 +411,7 @@
             <!-- Standard 模式参数 -->
             <template v-if="config.training.loss_mode === 'standard'">
               <div class="subsection-label">混合损失函数 (HYBRID LOSS)</div>
-              <div class="control-row">
+            <div class="control-row">
                 <span class="label">
                   Lambda FFT
                   <el-tooltip content="频域损失权重，帮助学习纹理细节，0=关闭" placement="top">
@@ -635,7 +635,7 @@ onMounted(async () => {
     await loadConfig(editConfig)
     ElMessage.info(`正在编辑配置: ${editConfig}`)
   } else {
-    await loadConfig('default')
+  await loadConfig('default')
   }
   
   await loadPresets()
