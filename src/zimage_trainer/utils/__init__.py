@@ -31,6 +31,14 @@ from .xformers_utils import (
     get_optimal_attention_backend,
     benchmark_attention_backends,
 )
+from .checkpoint_manager import CheckpointManager
+from .distributed_utils import (
+    setup_distributed_backend,
+    get_accelerate_launch_args,
+    get_num_available_gpus,
+    is_distributed_available,
+    get_distributed_info,
+)
 
 __all__ = [
     # VAE
@@ -67,4 +75,12 @@ __all__ = [
     "apply_xformers_to_transformer",
     "get_optimal_attention_backend",
     "benchmark_attention_backends",
+    # Resume Training (Checkpoint Manager)
+    "CheckpointManager",
+    # Distributed Training
+    "setup_distributed_backend",
+    "get_accelerate_launch_args",
+    "get_num_available_gpus",
+    "is_distributed_available",
+    "get_distributed_info",
 ]

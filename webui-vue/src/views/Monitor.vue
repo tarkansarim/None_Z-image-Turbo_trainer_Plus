@@ -77,6 +77,9 @@
       </div>
     </div>
 
+    <!-- === CUSTOM: Multi-GPU display (shows only if multiple GPUs detected) === -->
+    <MultiGpuMonitor />
+
     <!-- GPU 监控 -->
     <div class="gpu-monitor glass-card">
       <div class="chart-header">
@@ -144,6 +147,8 @@ import { ref, computed } from 'vue'
 import { useTrainingStore } from '@/stores/training'
 import { useSystemStore } from '@/stores/system'
 import VChart from 'vue-echarts'
+// === CUSTOM: Multi-GPU monitoring component ===
+import MultiGpuMonitor from '@/components/MultiGpuMonitor.vue'
 
 const trainingStore = useTrainingStore()
 const systemStore = useSystemStore()
@@ -172,9 +177,37 @@ const estimatedEndTime = computed(() => {
   return endDate.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 })
 
+// === CUSTOM: Track recent step times for rolling average ===
+const recentStepTimes = ref<number[]>([])
+let lastStepTime = 0
+let lastStepCount = 0
+
 const avgStepTime = computed(() => {
-  if (progress.value.currentStep === 0) return '--'
-  return (progress.value.elapsedTime / progress.value.currentStep).toFixed(2)
+  const currentStep = progress.value.currentStep
+  const now = Date.now()
+  
+  // Track time between steps for rolling average
+  if (currentStep > lastStepCount && lastStepTime > 0) {
+    const stepTime = (now - lastStepTime) / 1000 / (currentStep - lastStepCount)
+    recentStepTimes.value.push(stepTime)
+    // Keep only last 20 steps for rolling average
+    if (recentStepTimes.value.length > 20) {
+      recentStepTimes.value.shift()
+    }
+  }
+  lastStepTime = now
+  lastStepCount = currentStep
+  
+  // Use rolling average if available, otherwise fall back to session average
+  if (recentStepTimes.value.length >= 3) {
+    const avg = recentStepTimes.value.reduce((a, b) => a + b, 0) / recentStepTimes.value.length
+    return avg.toFixed(2)
+  }
+  
+  // Fallback to session average
+  const steps = progress.value.stepsThisSession ?? progress.value.currentStep
+  if (steps <= 0) return '--'
+  return (progress.value.elapsedTime / steps).toFixed(2)
 })
 
 const baseChartConfig = {

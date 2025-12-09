@@ -73,7 +73,10 @@ def get_default_config():
             "max_grad_norm": 1.0,
             "gradient_checkpointing": True,
             "mixed_precision": "bf16",
-            "seed": 42
+            "seed": 42,
+            "resume": False,  # 恢复训练模式
+            "multi_gpu": False,  # 多GPU训练
+            "num_gpus": 0  # GPU数量 (0=自动检测)
         }
     }
 
@@ -378,19 +381,62 @@ async def start_training(config: Dict[str, Any]):
         
         state.add_log(f"AC-RF 配置已生成: {config_path}", "info")
         
-        # 构建 accelerate launch 命令
+        # 构建训练命令
         # 使用 scripts/train_acrf.py (AC-RF 训练脚本)
         python_exe = sys.executable
         train_script = PROJECT_ROOT / "scripts" / "train_acrf.py"
         
         mixed_precision = config.get("advanced", {}).get("mixed_precision", "bf16")
+        multi_gpu = config.get("advanced", {}).get("multi_gpu", False)
+        num_gpus = config.get("advanced", {}).get("num_gpus", 0)
         
-        cmd = [
-            python_exe, "-m", "accelerate.commands.launch",
-            "--mixed_precision", mixed_precision,
-            str(train_script),
-            "--config", str(config_path)
-        ]
+        # 检测平台并选择分布式后端 (Windows: gloo, Linux: nccl)
+        import platform
+        distributed_backend = "gloo" if platform.system() == "Windows" else "nccl"
+        
+        if multi_gpu:
+            state.add_log(f"多GPU训练模式 (backend: {distributed_backend})", "info")
+            
+            # Auto-detect GPU count if not specified
+            if num_gpus == 0:
+                import torch
+                num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 1
+                state.add_log(f"自动检测到 {num_gpus} 个GPU", "info")
+            
+            if platform.system() == "Windows":
+                # Windows: use our custom launcher (Gloo + FileStore)
+                # This bypasses accelerate launch which has issues with kubernetes.docker.internal
+                multi_gpu_script = PROJECT_ROOT / "scripts" / "train_multi_gpu.py"
+                cmd = [
+                    python_exe,
+                    str(multi_gpu_script),
+                    "--config", str(config_path),
+                    f"--num_gpus={num_gpus}",
+                ]
+            else:
+                # Linux: use accelerate launch (NCCL + TCP) - optimal for Linux
+                cmd = [
+                    python_exe, "-m", "accelerate.commands.launch",
+                    "--multi_gpu",
+                    f"--num_processes={num_gpus}",
+                    f"--mixed_precision={mixed_precision}",
+                    str(train_script),
+                    "--config", str(config_path),
+                    "--distributed_backend", distributed_backend
+                ]
+        else:
+            # Single GPU: run directly without accelerate launcher (more stable)
+            cmd = [
+                python_exe,
+                str(train_script),
+                "--config", str(config_path),
+                "--distributed_backend", distributed_backend
+            ]
+        
+        # 如果配置要求恢复训练
+        if config.get("advanced", {}).get("resume", False):
+            cmd.append("--resume")
+            state.add_log("已启用恢复训练模式", "info")
         
         state.add_log(f"启动命令: {' '.join(cmd)}", "info")
         state.add_log(f"混合精度: {mixed_precision}", "info")
@@ -398,6 +444,25 @@ async def start_training(config: Dict[str, Any]):
         # 启动训练进程
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env["PYTHONPATH"] = str(PROJECT_ROOT / "src")  # Ensure src is in path
+        
+        # CRITICAL: Disable libuv for PyTorch distributed on Windows
+        # Must be set for both parent and child processes
+        env["USE_LIBUV"] = "0"
+        env["TORCH_DISTRIBUTED_USE_LIBUV"] = "0"
+        
+        # Multi-GPU: Set CUDA_VISIBLE_DEVICES to use all GPUs
+        if multi_gpu:
+            import torch
+            if torch.cuda.is_available():
+                gpu_count = num_gpus if num_gpus > 0 else torch.cuda.device_count()
+                # Create comma-separated list: "0,1,2,..." 
+                env["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(gpu_count))
+                state.add_log(f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}", "info")
+            
+            # Additional env vars for Windows multi-GPU stability
+            env["NCCL_DEBUG"] = "WARN"
+            env["TORCH_DISTRIBUTED_INIT_METHOD"] = "file"
         
         state.training_process = subprocess.Popen(
             cmd,
@@ -516,12 +581,41 @@ def generate_acrf_toml_config(config: Dict[str, Any]) -> str:
 
 @router.post("/stop")
 async def stop_training():
-    """Stop training process with proper cleanup"""
+    """Stop training process with proper cleanup (including child processes)"""
     if state.training_process:
         pid = state.training_process.pid
         state.add_log(f"正在停止训练进程 (PID: {pid})...", "warning")
         
-        # 先尝试优雅终止
+        # === CUSTOM: Kill all child processes (multi-GPU workers) ===
+        try:
+            import psutil
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            
+            # Kill children first
+            for child in children:
+                try:
+                    state.add_log(f"终止子进程 (PID: {child.pid})...", "info")
+                    child.terminate()
+                except psutil.NoSuchProcess:
+                    pass
+            
+            # Wait for children to terminate
+            gone, alive = psutil.wait_procs(children, timeout=5)
+            for p in alive:
+                try:
+                    p.kill()
+                except psutil.NoSuchProcess:
+                    pass
+                    
+        except ImportError:
+            state.add_log("psutil not installed, using basic termination", "warning")
+        except psutil.NoSuchProcess:
+            pass
+        except Exception as e:
+            state.add_log(f"清理子进程时出错: {e}", "warning")
+        
+        # Now terminate the parent
         state.training_process.terminate()
         
         # 等待进程结束（最多10秒）
@@ -539,6 +633,15 @@ async def stop_training():
         # 清理 Python 端的缓存
         import gc
         gc.collect()
+        
+        # === CUSTOM: Force CUDA cache clear ===
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                state.add_log("CUDA缓存已清理", "info")
+        except:
+            pass
         
     return {"status": "stopped"}
 

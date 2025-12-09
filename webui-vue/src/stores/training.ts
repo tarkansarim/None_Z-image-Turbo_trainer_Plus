@@ -49,6 +49,9 @@ export interface TrainingProgress {
   estimatedTimeRemaining: number
   lossHistory: number[]
   lrHistory: number[]
+  // === CUSTOM: For accurate s/step calculation on resume ===
+  sessionStartStep?: number
+  stepsThisSession?: number
 }
 
 export const useTrainingStore = defineStore('training', () => {

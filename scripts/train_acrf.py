@@ -30,6 +30,8 @@ from zimage_trainer.utils.memory_optimizer import MemoryOptimizer
 from zimage_trainer.utils.hardware_detector import HardwareDetector
 from zimage_trainer.utils.snr_utils import compute_snr_weights, print_anchor_snr_weights
 from zimage_trainer.losses import FrequencyAwareLoss, LatentStyleStructureLoss
+# === MODULAR EXTENSION === (easy to merge upstream - only this import needed)
+from zimage_trainer.extensions import TrainingExtensions
 
 import logging
 logging.basicConfig(
@@ -116,6 +118,13 @@ def parse_args():
     # 高级功能
     parser.add_argument("--max_grad_norm", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--gradient_checkpointing", action="store_true", help="启用梯度检查点")
+    
+    # 恢复训练 (Resume Training)
+    parser.add_argument("--resume", action="store_true", help="从上次保存的状态恢复训练")
+    
+    # 分布式训练 (Distributed Training)
+    parser.add_argument("--distributed_backend", type=str, default="auto",
+        choices=["auto", "gloo", "nccl"], help="分布式后端: auto=自动选择, gloo=Windows兼容, nccl=Linux最优")
     
     # 自动优化功能
     parser.add_argument("--auto_optimize", action="store_true", default=True, help="启用自动硬件优化")
@@ -289,6 +298,10 @@ def main():
     
     # 创建输出目录
     os.makedirs(args.output_dir, exist_ok=True)
+    
+    # === MODULAR EXTENSION: distributed setup ===
+    dist_backend = TrainingExtensions.setup_distributed(args.distributed_backend)
+    logger.info(f"[DIST] 分布式后端: {dist_backend}")
     
     # 初始化 Accelerator
     accelerator = Accelerator(
@@ -533,12 +546,20 @@ def main():
         transformer, network, optimizer, dataloader, lr_scheduler
     )
     
-    # 8. 训练循环
-    logger.info("\n" + "="*60)
-    logger.info("[TARGET] 开始训练")
-    logger.info("="*60)
+    # 7.5. Training Extensions (modular - handles resume, multi-GPU logging, etc.)
+    ext = TrainingExtensions(args.output_dir, accelerator, args.output_name)
     
-    global_step = 0
+    # Resume training (all logic encapsulated in extension)
+    start_epoch, global_step = ext.load_resume_state(
+        optimizer, lr_scheduler, network, resume_enabled=args.resume
+    )
+    
+    if ext.is_training_complete(start_epoch, args.num_train_epochs):
+        return
+    
+    # 8. 训练循环
+    ext.log_training_start(start_epoch, global_step, args.num_train_epochs)
+    
     # 禁用 tqdm 显示，改用 [STEP] 格式输出（避免日志重复）
     progress_bar = tqdm(total=args.max_train_steps, desc="Training", disable=True)
     
@@ -546,8 +567,8 @@ def main():
     ema_loss = None
     ema_decay = 0.99  # 平滑系数
     
-    for epoch in range(args.num_train_epochs):
-        logger.info(f"\nEpoch {epoch + 1}/{args.num_train_epochs}")
+    for epoch in range(start_epoch, args.num_train_epochs):
+        ext.log_epoch(epoch, args.num_train_epochs)
         transformer.train()
         
         for step, batch in enumerate(dataloader):
@@ -709,43 +730,39 @@ def main():
                 # 获取当前学习率
                 current_lr = lr_scheduler.get_last_lr()[0]
                 
-                # 打印进度供前端解析（根据损失模式输出不同信息）
+                # 打印进度供前端解析（使用 extension 确保只在主进程输出）
                 if loss_mode == 'standard':
-                    print(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema_loss={ema_loss:.4f} lr={current_lr:.2e}", flush=True)
+                    ext.print_step(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema_loss={ema_loss:.4f} lr={current_lr:.2e}")
                 elif loss_mode == 'frequency':
                     hf = loss_components.get('loss_hf', 0)
                     lf = loss_components.get('loss_lf', 0)
-                    print(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema={ema_loss:.4f} hf={hf:.4f} lf={lf:.4f} lr={current_lr:.2e}", flush=True)
+                    ext.print_step(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema={ema_loss:.4f} hf={hf:.4f} lf={lf:.4f} lr={current_lr:.2e}")
                 elif loss_mode == 'style':
                     struct = loss_components.get('loss_struct', 0)
                     light = loss_components.get('loss_light', 0)
                     color = loss_components.get('loss_color', 0)
-                    print(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema={ema_loss:.4f} struct={struct:.4f} light={light:.4f} color={color:.4f} lr={current_lr:.2e}", flush=True)
+                    ext.print_step(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema={ema_loss:.4f} struct={struct:.4f} light={light:.4f} color={color:.4f} lr={current_lr:.2e}")
                 elif loss_mode == 'unified':
                     freq = loss_components.get('freq', 0)
                     style = loss_components.get('style', 0)
-                    print(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema={ema_loss:.4f} freq={freq:.4f} style={style:.4f} lr={current_lr:.2e}", flush=True)
+                    ext.print_step(f"[STEP] {global_step}/{args.max_train_steps} epoch={epoch+1}/{args.num_train_epochs} loss={current_loss:.4f} ema={ema_loss:.4f} freq={freq:.4f} style={style:.4f} lr={current_lr:.2e}")
                 
             # 执行内存优化 (清理缓存等)
             memory_optimizer.optimize_training_step()
                 
-        # Epoch 结束，保存检查点
+        # Epoch 结束，保存检查点 (extension handles DDP unwrap & main-process-only)
         if (epoch + 1) % args.save_every_n_epochs == 0:
-            save_path = Path(args.output_dir) / f"{args.output_name}_epoch{epoch+1}.safetensors"
-            network.save_weights(save_path, dtype=weight_dtype)
-            logger.info(f"\n[SAVE] 保存检查点 (Epoch {epoch+1}): {save_path}")
+            ext.save_epoch_checkpoint(
+                network, optimizer, lr_scheduler, epoch, global_step, weight_dtype
+            )
     
-    # 保存最终模型
-    final_path = Path(args.output_dir) / f"{args.output_name}_final.safetensors"
-    network.save_weights(final_path, dtype=weight_dtype)
+    # 保存最终模型 (extension handles DDP unwrap & synchronization)
+    final_path = ext.save_final_checkpoint(network, weight_dtype)
     
     # 停止内存优化器
     memory_optimizer.stop()
     
-    logger.info("\n" + "="*60)
-    logger.info(f"[OK] 训练完成！")
-    logger.info(f"最终模型: {final_path}")
-    logger.info("="*60)
+    ext.log_training_complete(final_path)
 
 
 if __name__ == "__main__":

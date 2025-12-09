@@ -248,6 +248,35 @@
               </span>
               <el-input-number v-model="config.advanced.seed" :min="0" controls-position="right" style="width: 150px" />
             </div>
+
+            <div class="subsection-label">恢复与分布式 (RESUME & DISTRIBUTED)</div>
+            <div class="control-row">
+              <span class="label">
+                恢复训练
+                <el-tooltip content="从上次中断的地方继续训练，需要输出目录中有 training_state.pt 文件" placement="top">
+                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </span>
+              <el-switch v-model="config.advanced.resume" />
+            </div>
+            <div class="control-row">
+              <span class="label">
+                多GPU训练
+                <el-tooltip content="启用多GPU并行训练，需要2张以上显卡" placement="top">
+                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </span>
+              <el-switch v-model="config.advanced.multi_gpu" />
+            </div>
+            <div class="control-row" v-if="config.advanced.multi_gpu">
+              <span class="label">
+                GPU数量
+                <el-tooltip content="参与训练的GPU数量，0=自动检测全部可用GPU" placement="top">
+                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </span>
+              <el-input-number v-model="config.advanced.num_gpus" :min="0" :max="8" controls-position="right" style="width: 150px" />
+            </div>
           </div>
         </el-collapse-item>
 
@@ -524,6 +553,35 @@
               <el-slider v-model="config.training.weight_decay" :min="0" :max="0.1" :step="0.001" :show-tooltip="false" class="slider-flex" />
               <el-input-number v-model="config.training.weight_decay" :min="0" :step="0.001" controls-position="right" class="input-fixed" :precision="3" />
             </div>
+
+            <div class="subsection-label">恢复与分布式训练 (RESUME & DISTRIBUTED)</div>
+            <div class="control-row">
+              <span class="label">
+                恢复训练 (Resume)
+                <el-tooltip content="从上次中断的地方继续训练，需要输出目录中有 training_state.pt 文件" placement="top">
+                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </span>
+              <el-switch v-model="config.advanced.resume" />
+            </div>
+            <div class="control-row">
+              <span class="label">
+                多GPU训练 (Multi-GPU)
+                <el-tooltip content="启用多GPU并行训练，使用Gloo后端(Windows)或NCCL后端(Linux)" placement="top">
+                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </span>
+              <el-switch v-model="config.advanced.multi_gpu" />
+            </div>
+            <div class="control-row" v-if="config.advanced.multi_gpu">
+              <span class="label">
+                GPU数量
+                <el-tooltip content="参与训练的GPU数量，0=自动检测全部可用GPU" placement="top">
+                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </span>
+              <el-input-number v-model="config.advanced.num_gpus" :min="0" :max="8" controls-position="right" style="width: 150px" />
+            </div>
           </div>
         </el-collapse-item>
       </el-collapse>
@@ -619,7 +677,10 @@ function getDefaultConfig() {
       save_every_n_epochs: 1,
       gradient_accumulation_steps: 4,
       mixed_precision: 'bf16',
-      seed: 42
+      seed: 42,
+      resume: false,
+      multi_gpu: false,
+      num_gpus: 0
     }
   }
 }

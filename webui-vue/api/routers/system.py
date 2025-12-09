@@ -636,7 +636,7 @@ async def get_download_status():
 
 @router.get("/gpu")
 async def get_gpu_info():
-    """Get GPU information using nvidia-smi"""
+    """Get GPU information using nvidia-smi (supports multi-GPU, returns all GPUs + summary)"""
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu",
@@ -649,17 +649,49 @@ async def get_gpu_info():
         )
         
         if result.returncode == 0:
-            parts = result.stdout.strip().split(", ")
-            if len(parts) >= 5:
-                memory_total = float(parts[1]) / 1024  # Convert MB to GB
-                memory_used = float(parts[2]) / 1024
+            lines = result.stdout.strip().split("\n")
+            gpus = []
+            total_memory = 0
+            total_used = 0
+            total_util = 0
+            max_temp = 0
+            
+            for i, line in enumerate(lines):
+                parts = line.strip().split(", ")
+                if len(parts) >= 5:
+                    mem_total = float(parts[1]) / 1024  # MB -> GB
+                    mem_used = float(parts[2]) / 1024
+                    util = int(parts[3])
+                    temp = int(parts[4])
+                    
+                    gpus.append({
+                        "index": i,
+                        "name": parts[0],
+                        "memoryTotal": round(mem_total, 1),
+                        "memoryUsed": round(mem_used, 1),
+                        "memoryPercent": round((mem_used / mem_total) * 100) if mem_total > 0 else 0,
+                        "utilization": util,
+                        "temperature": temp
+                    })
+                    
+                    total_memory += mem_total
+                    total_used += mem_used
+                    total_util += util
+                    max_temp = max(max_temp, temp)
+            
+            num_gpus = len(gpus)
+            if num_gpus > 0:
                 return {
-                    "name": parts[0],
-                    "memoryTotal": round(memory_total, 1),
-                    "memoryUsed": round(memory_used, 1),
-                    "memoryPercent": round((memory_used / memory_total) * 100),
-                    "utilization": int(parts[3]),
-                    "temperature": int(parts[4])
+                    # Summary (compatible with single-GPU display)
+                    "name": gpus[0]["name"] if num_gpus == 1 else f"{num_gpus}x {gpus[0]['name']}",
+                    "memoryTotal": round(total_memory, 1),
+                    "memoryUsed": round(total_used, 1),
+                    "memoryPercent": round((total_used / total_memory) * 100) if total_memory > 0 else 0,
+                    "utilization": round(total_util / num_gpus),  # Average utilization
+                    "temperature": max_temp,  # Highest temperature
+                    # Multi-GPU details
+                    "numGpus": num_gpus,
+                    "gpus": gpus
                 }
     except Exception as e:
         print(f"GPU info error: {e}")
@@ -670,5 +702,7 @@ async def get_gpu_info():
         "memoryUsed": 0,
         "memoryPercent": 0,
         "utilization": 0,
-        "temperature": 0
+        "temperature": 0,
+        "numGpus": 0,
+        "gpus": []
     }

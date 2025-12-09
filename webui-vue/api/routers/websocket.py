@@ -544,7 +544,7 @@ def parse_cache_progress(line: str) -> Optional[Dict[str, Any]]:
 
 
 async def get_gpu_info() -> Dict[str, Any]:
-    """获取 GPU 信息"""
+    """获取 GPU 信息 (支持多GPU系统，返回所有GPU + 汇总)"""
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None,
@@ -560,17 +560,49 @@ async def get_gpu_info() -> Dict[str, Any]:
         )
         
         if result.returncode == 0:
-            parts = result.stdout.strip().split(", ")
-            if len(parts) >= 5:
-                memory_total = float(parts[1]) / 1024  # MB -> GB
-                memory_used = float(parts[2]) / 1024
+            lines = result.stdout.strip().split("\n")
+            gpus = []
+            total_memory = 0
+            total_used = 0
+            total_util = 0
+            max_temp = 0
+            
+            for i, line in enumerate(lines):
+                parts = line.strip().split(", ")
+                if len(parts) >= 5:
+                    mem_total = float(parts[1]) / 1024  # MB -> GB
+                    mem_used = float(parts[2]) / 1024
+                    util = int(parts[3])
+                    temp = int(parts[4])
+                    
+                    gpus.append({
+                        "index": i,
+                        "name": parts[0],
+                        "memoryTotal": round(mem_total, 1),
+                        "memoryUsed": round(mem_used, 1),
+                        "memoryPercent": round((mem_used / mem_total) * 100) if mem_total > 0 else 0,
+                        "utilization": util,
+                        "temperature": temp
+                    })
+                    
+                    total_memory += mem_total
+                    total_used += mem_used
+                    total_util += util
+                    max_temp = max(max_temp, temp)
+            
+            num_gpus = len(gpus)
+            if num_gpus > 0:
                 return {
-                    "name": parts[0],
-                    "memoryTotal": round(memory_total, 1),
-                    "memoryUsed": round(memory_used, 1),
-                    "memoryPercent": round((memory_used / memory_total) * 100),
-                    "utilization": int(parts[3]),
-                    "temperature": int(parts[4])
+                    # 汇总数据 (兼容单GPU显示)
+                    "name": gpus[0]["name"] if num_gpus == 1 else f"{num_gpus}x {gpus[0]['name']}",
+                    "memoryTotal": round(total_memory, 1),
+                    "memoryUsed": round(total_used, 1),
+                    "memoryPercent": round((total_used / total_memory) * 100) if total_memory > 0 else 0,
+                    "utilization": round(total_util / num_gpus),  # 平均利用率
+                    "temperature": max_temp,  # 最高温度
+                    # 多GPU详情
+                    "numGpus": num_gpus,
+                    "gpus": gpus
                 }
     except Exception as e:
         print(f"GPU info error: {e}")
@@ -581,7 +613,9 @@ async def get_gpu_info() -> Dict[str, Any]:
         "memoryUsed": 0,
         "memoryPercent": 0,
         "utilization": 0,
-        "temperature": 0
+        "temperature": 0,
+        "numGpus": 0,
+        "gpus": []
     }
 
 
