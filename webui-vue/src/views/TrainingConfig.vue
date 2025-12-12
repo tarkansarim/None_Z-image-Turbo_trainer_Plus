@@ -10,6 +10,7 @@
             <el-option v-for="cfg in savedConfigs.filter(c => c.name !== 'default')" :key="cfg.name" :label="cfg.name" :value="cfg.name" />
           </el-select>
           <el-button @click="showNewConfigDialog = true" :icon="Plus">新建</el-button>
+          <el-button type="success" @click="overwriteCurrentConfig" :loading="saving" :icon="Check">保存</el-button>
           <el-button @click="showSaveAsDialog = true" :icon="Document">另存为</el-button>
           <el-button type="primary" @click="saveCurrentConfig" :loading="saving" :icon="Check">发送训练器</el-button>
           <el-button type="danger" @click="deleteCurrentConfig" :disabled="currentConfigName === 'default'" :icon="Delete">删除</el-button>
@@ -248,35 +249,6 @@
               </span>
               <el-input-number v-model="config.advanced.seed" :min="0" controls-position="right" style="width: 150px" />
             </div>
-
-            <div class="subsection-label">恢复与分布式 (RESUME & DISTRIBUTED)</div>
-            <div class="control-row">
-              <span class="label">
-                恢复训练
-                <el-tooltip content="从上次中断的地方继续训练，需要输出目录中有 training_state.pt 文件" placement="top">
-                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
-                </el-tooltip>
-              </span>
-              <el-switch v-model="config.advanced.resume" />
-            </div>
-            <div class="control-row">
-              <span class="label">
-                多GPU训练
-                <el-tooltip content="启用多GPU并行训练，需要2张以上显卡" placement="top">
-                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
-                </el-tooltip>
-              </span>
-              <el-switch v-model="config.advanced.multi_gpu" />
-            </div>
-            <div class="control-row" v-if="config.advanced.multi_gpu">
-              <span class="label">
-                GPU数量
-                <el-tooltip content="参与训练的GPU数量，0=自动检测全部可用GPU" placement="top">
-                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
-                </el-tooltip>
-              </span>
-              <el-input-number v-model="config.advanced.num_gpus" :min="0" :max="8" controls-position="right" style="width: 150px" />
-            </div>
           </div>
         </el-collapse-item>
 
@@ -366,6 +338,101 @@
                 <el-slider v-model="ds.resolution_limit" :min="256" :max="2048" :step="64" :show-tooltip="false" class="slider-flex" />
                 <el-input-number v-model="ds.resolution_limit" :min="256" :max="2048" :step="64" controls-position="right" class="input-fixed" />
               </div>
+              
+              <!-- === CUSTOM: Per-Dataset Loss Weights - Standard Mode === -->
+              <template v-if="config.training.loss_scope === 'per_dataset' && config.training.loss_mode === 'standard'">
+                <div class="subsection-label" style="margin-top: 12px;">混合损失函数 (HYBRID LOSS)</div>
+                <div class="control-row">
+                  <span class="label">
+                    Lambda FFT
+                    <el-tooltip content="频域损失权重，帮助学习纹理细节，0=关闭" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </span>
+                  <el-slider v-model="ds.lambda_fft" :min="0" :max="1" :step="0.01" :show-tooltip="false" class="slider-flex" />
+                  <el-input-number v-model="ds.lambda_fft" :min="0" :max="1" :step="0.01" controls-position="right" class="input-fixed" />
+                </div>
+                <div class="control-row">
+                  <span class="label">
+                    Lambda Cosine
+                    <el-tooltip content="余弦相似度损失权重，帮助保持整体结构，0=关闭" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </span>
+                  <el-slider v-model="ds.lambda_cosine" :min="0" :max="1" :step="0.01" :show-tooltip="false" class="slider-flex" />
+                  <el-input-number v-model="ds.lambda_cosine" :min="0" :max="1" :step="0.01" controls-position="right" class="input-fixed" />
+                </div>
+              </template>
+              
+              <!-- === CUSTOM: Per-Dataset Loss Weights - Frequency Mode === -->
+              <template v-if="config.training.loss_scope === 'per_dataset' && (config.training.loss_mode === 'frequency' || config.training.loss_mode === 'unified')">
+                <div class="subsection-label" style="margin-top: 12px;">频域感知参数 (FREQUENCY AWARE)</div>
+                <div class="control-row">
+                  <span class="label">
+                    高频权重 (alpha_hf)
+                    <el-tooltip content="高频增强权重，提升边缘/纹理锐度，推荐 0.5~1.0" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </span>
+                  <el-slider v-model="ds.alpha_hf" :min="0" :max="2" :step="0.1" :show-tooltip="false" class="slider-flex" />
+                  <el-input-number v-model="ds.alpha_hf" :min="0" :max="2" :step="0.1" controls-position="right" class="input-fixed" />
+                </div>
+                <div class="control-row">
+                  <span class="label">
+                    低频权重 (beta_lf)
+                    <el-tooltip content="低频锁定权重，保持整体结构方向，推荐 0.1~0.3" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </span>
+                  <el-slider v-model="ds.beta_lf" :min="0" :max="1" :step="0.05" :show-tooltip="false" class="slider-flex" />
+                  <el-input-number v-model="ds.beta_lf" :min="0" :max="1" :step="0.05" controls-position="right" class="input-fixed" />
+                </div>
+              </template>
+              
+              <!-- === CUSTOM: Per-Dataset Loss Weights - Style Mode === -->
+              <template v-if="config.training.loss_scope === 'per_dataset' && ['style', 'unified'].includes(config.training.loss_mode)">
+                <div class="subsection-label" style="margin-top: 12px;">风格结构参数 (STYLE STRUCTURE)</div>
+                <div class="control-row">
+                  <span class="label">
+                    结构锁 (lambda_struct)
+                    <el-tooltip content="SSIM 结构锁定，防止脸崩/五官错位，推荐 0.5~1.0" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </span>
+                  <el-slider v-model="ds.lambda_struct" :min="0" :max="2" :step="0.1" :show-tooltip="false" class="slider-flex" />
+                  <el-input-number v-model="ds.lambda_struct" :min="0" :max="2" :step="0.1" controls-position="right" class="input-fixed" />
+                </div>
+                <div class="control-row">
+                  <span class="label">
+                    光影学习 (lambda_light)
+                    <el-tooltip content="学习大师的 S 曲线、对比度，推荐 0.3~0.8" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </span>
+                  <el-slider v-model="ds.lambda_light" :min="0" :max="1" :step="0.1" :show-tooltip="false" class="slider-flex" />
+                  <el-input-number v-model="ds.lambda_light" :min="0" :max="1" :step="0.1" controls-position="right" class="input-fixed" />
+                </div>
+                <div class="control-row">
+                  <span class="label">
+                    色调迁移 (lambda_color)
+                    <el-tooltip content="学习冷暖调/胶片感，推荐 0.2~0.5" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </span>
+                  <el-slider v-model="ds.lambda_color" :min="0" :max="1" :step="0.1" :show-tooltip="false" class="slider-flex" />
+                  <el-input-number v-model="ds.lambda_color" :min="0" :max="1" :step="0.1" controls-position="right" class="input-fixed" />
+                </div>
+                <div class="control-row">
+                  <span class="label">
+                    质感增强 (lambda_tex)
+                    <el-tooltip content="高频 L1 增强清晰度/颗粒感，推荐 0.3~0.5" placement="top">
+                      <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                    </el-tooltip>
+                  </span>
+                  <el-slider v-model="ds.lambda_tex" :min="0" :max="1" :step="0.1" :show-tooltip="false" class="slider-flex" />
+                  <el-input-number v-model="ds.lambda_tex" :min="0" :max="1" :step="0.1" controls-position="right" class="input-fixed" />
+                </div>
+              </template>
             </div>
           </div>
         </el-collapse-item>
@@ -437,10 +504,24 @@
               </el-select>
             </div>
             
-            <!-- Standard 模式参数 -->
-            <template v-if="config.training.loss_mode === 'standard'">
-              <div class="subsection-label">混合损失函数 (HYBRID LOSS)</div>
+            <!-- === CUSTOM: Loss Scope Switch (Global vs Per-Dataset) - All modes === -->
             <div class="control-row">
+              <span class="label">
+                损失权重范围
+                <el-tooltip content="Global=所有数据集使用相同权重, Per Dataset=每个数据集可设置不同权重" placement="top">
+                  <el-icon class="help-icon"><QuestionFilled /></el-icon>
+                </el-tooltip>
+              </span>
+              <el-radio-group v-model="config.training.loss_scope">
+                <el-radio label="global">Global (全局)</el-radio>
+                <el-radio label="per_dataset">Per Dataset (按数据集)</el-radio>
+              </el-radio-group>
+            </div>
+            
+            <!-- Standard 模式参数 (only shown in global scope mode) -->
+            <template v-if="config.training.loss_mode === 'standard' && config.training.loss_scope !== 'per_dataset'">
+              <div class="subsection-label">混合损失函数 (HYBRID LOSS) - 全局设置</div>
+              <div class="control-row">
                 <span class="label">
                   Lambda FFT
                   <el-tooltip content="频域损失权重，帮助学习纹理细节，0=关闭" placement="top">
@@ -462,9 +543,9 @@
               </div>
             </template>
             
-            <!-- Frequency 模式参数 -->
-            <template v-if="config.training.loss_mode === 'frequency' || config.training.loss_mode === 'unified'">
-              <div class="subsection-label">频域感知参数 (FREQUENCY AWARE)</div>
+            <!-- Frequency 模式参数 (only shown in global scope mode) -->
+            <template v-if="(config.training.loss_mode === 'frequency' || config.training.loss_mode === 'unified') && config.training.loss_scope !== 'per_dataset'">
+              <div class="subsection-label">频域感知参数 (FREQUENCY AWARE) - 全局设置</div>
               <div class="control-row">
                 <span class="label">
                   高频权重 (alpha_hf)
@@ -487,9 +568,9 @@
               </div>
             </template>
             
-            <!-- Style 模式参数 -->
-            <template v-if="config.training.loss_mode === 'style' || config.training.loss_mode === 'unified'">
-              <div class="subsection-label">风格结构参数 (STYLE STRUCTURE)</div>
+            <!-- Style 模式参数 (only shown in global scope mode) -->
+            <template v-if="(config.training.loss_mode === 'style' || config.training.loss_mode === 'unified') && config.training.loss_scope !== 'per_dataset'">
+              <div class="subsection-label">风格结构参数 (STYLE STRUCTURE) - 全局设置</div>
               <div class="control-row">
                 <span class="label">
                   结构锁 (lambda_struct)
@@ -655,6 +736,8 @@ function getDefaultConfig() {
       lambda_cosine: 0,
       // 损失模式
       loss_mode: 'standard',
+      // === CUSTOM: Loss scope (global vs per_dataset) ===
+      loss_scope: 'global',
       // 频域感知参数
       alpha_hf: 1.0,
       beta_lf: 0.2,
@@ -752,7 +835,7 @@ async function loadSavedConfig() {
   }
 }
 
-// Save current config
+// Save current config and send to trainer
 async function saveCurrentConfig() {
   if (!currentConfigName.value) {
     ElMessage.warning('请先选择或创建一个配置')
@@ -766,6 +849,28 @@ async function saveCurrentConfig() {
       config: config.value
     })
     ElMessage.success('配置已发送到训练器')
+    await loadConfigList()
+  } catch (e: any) {
+    ElMessage.error('保存失败: ' + (e.response?.data?.detail || e.message))
+  } finally {
+    saving.value = false
+  }
+}
+
+// Overwrite (save) current config without sending to trainer
+async function overwriteCurrentConfig() {
+  if (!currentConfigName.value) {
+    ElMessage.warning('请先选择或创建一个配置')
+    return
+  }
+  
+  saving.value = true
+  try {
+    await axios.post('/api/training/config/save', {
+      name: currentConfigName.value,
+      config: config.value
+    })
+    ElMessage.success(`配置 "${currentConfigName.value}" 已保存`)
     await loadConfigList()
   } catch (e: any) {
     ElMessage.error('保存失败: ' + (e.response?.data?.detail || e.message))
@@ -891,7 +996,19 @@ function addDatasetFromCache(datasetPath: string) {
   config.value.dataset.datasets.push({
     cache_directory: datasetPath,
     num_repeats: 1,
-    resolution_limit: 1024
+    resolution_limit: 1024,
+    // === CUSTOM: Per-dataset loss weights (defaults) ===
+    // Standard mode
+    lambda_fft: 0.0,
+    lambda_cosine: 0.0,
+    // Frequency mode
+    alpha_hf: 1.0,
+    beta_lf: 0.2,
+    // Style mode
+    lambda_struct: 1.0,
+    lambda_light: 0.0,
+    lambda_color: 0.0,
+    lambda_tex: 0.0
   })
 }
 
@@ -900,7 +1017,19 @@ function addDataset() {
   config.value.dataset.datasets.push({
     cache_directory: '',
     num_repeats: 1,
-    resolution_limit: 1024
+    resolution_limit: 1024,
+    // === CUSTOM: Per-dataset loss weights (defaults) ===
+    // Standard mode
+    lambda_fft: 0.0,
+    lambda_cosine: 0.0,
+    // Frequency mode
+    alpha_hf: 1.0,
+    beta_lf: 0.2,
+    // Style mode
+    lambda_struct: 1.0,
+    lambda_light: 0.0,
+    lambda_color: 0.0,
+    lambda_tex: 0.0
   })
 }
 
