@@ -53,6 +53,12 @@ const router = createRouter({
       name: 'LoraManager',
       component: () => import('@/views/LoraManager.vue'),
       meta: { title: 'LoRA 管理' }
+    },
+    {
+      path: '/jobs',
+      name: 'JobHistory',
+      component: () => import('@/views/JobHistory.vue'),
+      meta: { title: '训练历史' }
     }
   ]
 })

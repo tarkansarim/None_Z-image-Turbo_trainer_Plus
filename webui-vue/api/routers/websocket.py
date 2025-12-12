@@ -15,6 +15,8 @@ from pathlib import Path
 from core.config import MODEL_PATH, PROJECT_ROOT
 from core import state
 from core.state import get_generation_status
+from core import job_service
+from core.job_service import JobStatus
 
 router = APIRouter(tags=["websocket"])
 
@@ -268,6 +270,34 @@ class ConnectionManager:
         
         if updates:
             state.update_training_history(**updates)
+            
+            # === JOB TRACKING: Update job progress ===
+            self._update_job_progress(updates)
+    
+    def _update_job_progress(self, updates: Dict[str, Any]):
+        """Update job progress in database"""
+        # Import here to avoid circular import
+        from routers.training import get_current_job_id
+        
+        job_id = get_current_job_id()
+        if not job_id:
+            return
+        
+        current_epoch = updates.get("current_epoch", 0)
+        current_step = updates.get("current_step", 0)
+        total_steps = updates.get("total_steps", 0)
+        loss = updates.get("loss")
+        lr = updates.get("learning_rate")
+        
+        if current_step > 0 or loss is not None:
+            job_service.update_job_progress(
+                job_id,
+                current_epoch=current_epoch,
+                current_step=current_step,
+                total_steps=total_steps,
+                loss=loss,
+                lr=lr
+            )
 
 
 # 全局连接管理器
@@ -785,6 +815,12 @@ def get_training_status() -> Dict[str, Any]:
     elif return_code == 0:
         state.add_log("训练完成", "success")
         state.training_process = None  # 清除引用，防止重复添加日志
+        
+        # === JOB TRACKING: Mark job as completed ===
+        from routers.training import mark_current_job_completed
+        history = state.get_training_history()
+        mark_current_job_completed(final_loss=history.get("loss"))
+        
         return {"status": "completed", "running": False}
     else:
         # 获取详细错误信息
@@ -818,6 +854,10 @@ def get_training_status() -> Dict[str, Any]:
         
         state.add_log(f"{error_msg}: {hint}", "error")
         state.training_process = None  # 清除引用，防止重复添加日志
+        
+        # === JOB TRACKING: Mark job as failed ===
+        from routers.training import mark_current_job_failed
+        mark_current_job_failed(f"{error_msg}: {hint}")
         
         return {
             "status": "failed", 

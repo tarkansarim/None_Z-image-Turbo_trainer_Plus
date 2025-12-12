@@ -1,5 +1,5 @@
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import json
 import re
 import subprocess
@@ -10,8 +10,13 @@ from pathlib import Path
 
 from core.config import CONFIGS_DIR, OUTPUT_BASE_DIR, MODEL_PATH, SaveConfigRequest, PROJECT_ROOT
 from core import state
+from core import job_service
+from core.job_service import JobStatus
 
 router = APIRouter(prefix="/api/training", tags=["training"])
+
+# Track current job ID for progress updates
+_current_job_id: Optional[str] = None
 
 # Windows 兼容性：获取 subprocess 创建标志
 def _get_subprocess_flags():
@@ -271,7 +276,16 @@ def check_dataset_cache(config: Dict[str, Any]) -> Dict[str, Any]:
     datasets = dataset_cfg.get("datasets", [])
     
     if not datasets:
-        return {"has_cache": True, "message": "No datasets configured"}
+        # Return full dict structure even when no datasets (prevents KeyError)
+        return {
+            "has_cache": True, 
+            "message": "No datasets configured",
+            "total_images": 0,
+            "latent_cached": 0,
+            "text_cached": 0,
+            "latent_missing": 0,
+            "text_missing": 0
+        }
     
     total_images = 0
     latent_cached = 0
@@ -316,11 +330,17 @@ def check_dataset_cache(config: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @router.post("/start")
-async def start_training(config: Dict[str, Any]):
+async def start_training(config: Dict[str, Any], job_id: Optional[str] = None):
     """Start AC-RF training with accelerate launch
     
     如果缓存不完整，返回 needs_cache=True，前端应该先执行缓存
+    
+    Args:
+        config: Training configuration
+        job_id: Optional job ID to resume. If not provided, creates a new job.
     """
+    global _current_job_id
+    
     if state.training_process and state.training_process.poll() is None:
         raise HTTPException(status_code=400, detail="训练已在运行中")
     
@@ -336,6 +356,28 @@ async def start_training(config: Dict[str, Any]):
             "type": "training_reset",
             "training_history": state.get_training_history()  # 发送空的历史数据
         }))
+        
+        # === JOB TRACKING: Create or resume job ===
+        output_name = config.get("training", {}).get("output_name", "zimage-lora")
+        config_name = config.get("name", "default")
+        
+        if job_id:
+            # Resuming existing job
+            job = job_service.get_job(job_id)
+            if job is None:
+                raise HTTPException(status_code=404, detail="Job not found")
+            _current_job_id = job_id
+            state.add_log(f"恢复任务: {job['name']} (ID: {job_id[:8]}...)", "info")
+        else:
+            # Create new job
+            job_id = job_service.create_job(
+                name=output_name,
+                config_name=config_name,
+                config_data=config,
+                output_dir=str(OUTPUT_BASE_DIR)
+            )
+            _current_job_id = job_id
+            state.add_log(f"创建新任务: {output_name} (ID: {job_id[:8]}...)", "info")
         
         # 如果有生成模型加载，先卸载释放显存
         if state.pipeline is not None:
@@ -356,7 +398,14 @@ async def start_training(config: Dict[str, Any]):
             state.add_log("生成模型已卸载", "info")
         
         # 检查缓存状态
+        # Debug: Log datasets being checked
+        datasets_to_check = config.get("dataset", {}).get("datasets", [])
+        state.add_log(f"DEBUG: 检查 {len(datasets_to_check)} 个数据集的缓存状态", "info")
+        for idx, ds in enumerate(datasets_to_check):
+            state.add_log(f"DEBUG: Dataset {idx}: {ds.get('cache_directory', 'NO PATH')}", "info")
+        
         cache_info = check_dataset_cache(config)
+        state.add_log(f"DEBUG: cache_info = {cache_info}", "info")
         if not cache_info["has_cache"]:
             state.add_log(f"缓存不完整: Latent {cache_info['latent_cached']}/{cache_info['total_images']}, Text {cache_info['text_cached']}/{cache_info['total_images']}", "warning")
             return {
@@ -479,15 +528,29 @@ async def start_training(config: Dict[str, Any]):
         
         state.add_log(f"AC-RF 训练进程已启动 (PID: {state.training_process.pid})", "success")
         
+        # === JOB TRACKING: Update job status to running ===
+        if _current_job_id:
+            total_epochs = config.get("advanced", {}).get("num_train_epochs", 10)
+            job_service.update_job_status(
+                _current_job_id,
+                JobStatus.RUNNING,
+                total_epochs=total_epochs
+            )
+            job_service.save_job_log(_current_job_id, "info", f"Training started (PID: {state.training_process.pid})")
+        
         return {
             "success": True,
             "message": "AC-RF 训练已启动",
             "pid": state.training_process.pid,
-            "config_path": str(config_path)
+            "config_path": str(config_path),
+            "job_id": _current_job_id
         }
         
     except Exception as e:
         state.add_log(f"启动失败: {str(e)}", "error")
+        # === JOB TRACKING: Mark job as failed ===
+        if _current_job_id:
+            job_service.update_job_status(_current_job_id, JobStatus.FAILED, error_message=str(e))
         raise HTTPException(status_code=500, detail=f"启动训练失败: {str(e)}")
 
 
@@ -535,10 +598,12 @@ def generate_acrf_toml_config(config: Dict[str, Any]) -> str:
         f"lambda_cosine = {config.get('training', {}).get('lambda_cosine', 0)}",
         # 损失模式
         f'loss_mode = "{config.get("training", {}).get("loss_mode", "standard")}"',
+        # === CUSTOM: Loss scope (global vs per_dataset) ===
+        f'loss_scope = "{config.get("training", {}).get("loss_scope", "global")}"',
         # 频域感知参数
         f"alpha_hf = {config.get('training', {}).get('alpha_hf', 1.0)}",
         f"beta_lf = {config.get('training', {}).get('beta_lf', 0.2)}",
-        # 风格结构参数
+        # 风格结构参数 (used when loss_scope = "global")
         f"lambda_struct = {config.get('training', {}).get('lambda_struct', 1.0)}",
         f"lambda_light = {config.get('training', {}).get('lambda_light', 0.5)}",
         f"lambda_color = {config.get('training', {}).get('lambda_color', 0.3)}",
@@ -565,16 +630,41 @@ def generate_acrf_toml_config(config: Dict[str, Any]) -> str:
     ]
     
     # 添加数据集源（带完整配置）
+    loss_scope = config.get("training", {}).get("loss_scope", "global")
+    loss_mode = config.get("training", {}).get("loss_mode", "standard")
     for ds in datasets:
         cache_dir = ds.get("cache_directory", "")
         if cache_dir:
-            toml_lines.extend([
+            ds_lines = [
                 "[[dataset.sources]]",
                 f'cache_directory = "{cache_dir.replace(chr(92), "/")}"',
                 f"num_repeats = {ds.get('num_repeats', 1)}",
                 f"resolution_limit = {ds.get('resolution_limit', 1024)}",
-                "",
-            ])
+            ]
+            # === CUSTOM: Include per-dataset loss weights when loss_scope = "per_dataset" ===
+            if loss_scope == "per_dataset":
+                # Standard mode params
+                if loss_mode == "standard":
+                    ds_lines.extend([
+                        f"lambda_fft = {ds.get('lambda_fft', 0.0)}",
+                        f"lambda_cosine = {ds.get('lambda_cosine', 0.0)}",
+                    ])
+                # Frequency mode params
+                if loss_mode in ["frequency", "unified"]:
+                    ds_lines.extend([
+                        f"alpha_hf = {ds.get('alpha_hf', 1.0)}",
+                        f"beta_lf = {ds.get('beta_lf', 0.2)}",
+                    ])
+                # Style mode params
+                if loss_mode in ["style", "unified"]:
+                    ds_lines.extend([
+                        f"lambda_struct = {ds.get('lambda_struct', 1.0)}",
+                        f"lambda_light = {ds.get('lambda_light', 0.0)}",
+                        f"lambda_color = {ds.get('lambda_color', 0.0)}",
+                        f"lambda_tex = {ds.get('lambda_tex', 0.0)}",
+                    ])
+            ds_lines.append("")
+            toml_lines.extend(ds_lines)
     
     return "\n".join(toml_lines)
 
@@ -582,6 +672,8 @@ def generate_acrf_toml_config(config: Dict[str, Any]) -> str:
 @router.post("/stop")
 async def stop_training():
     """Stop training process with proper cleanup (including child processes)"""
+    global _current_job_id
+    
     if state.training_process:
         pid = state.training_process.pid
         state.add_log(f"正在停止训练进程 (PID: {pid})...", "warning")
@@ -630,6 +722,20 @@ async def stop_training():
         state.training_process = None
         state.add_log("训练已停止，显存将被释放", "warning")
         
+        # === JOB TRACKING: Update job status to stopped ===
+        if _current_job_id:
+            # Get current progress from state for checkpoint info
+            history = state.get_training_history()
+            job_service.update_job_status(
+                _current_job_id,
+                JobStatus.STOPPED,
+                current_epoch=history.get("current_epoch", 0),
+                current_step=history.get("current_step", 0),
+                final_loss=history.get("loss", None)
+            )
+            job_service.save_job_log(_current_job_id, "warning", "Training stopped by user")
+            _current_job_id = None
+        
         # 清理 Python 端的缓存
         import gc
         gc.collect()
@@ -651,8 +757,115 @@ async def get_training_status():
     is_running = state.training_process is not None and state.training_process.poll() is None
     return {
         "running": is_running,
-        "pid": state.training_process.pid if state.training_process else None
+        "pid": state.training_process.pid if state.training_process else None,
+        "job_id": _current_job_id
     }
+
+
+@router.post("/jobs/{job_id}/resume")
+async def resume_job(job_id: str):
+    """Resume a stopped job."""
+    global _current_job_id
+    
+    if state.training_process and state.training_process.poll() is None:
+        raise HTTPException(status_code=400, detail="训练已在运行中")
+    
+    # Get job
+    job = job_service.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    # Check status
+    if job["status"] not in [JobStatus.PENDING, JobStatus.STOPPED, JobStatus.FAILED]:
+        raise HTTPException(status_code=400, detail=f"Cannot resume job with status: {job['status']}")
+    
+    # Get config snapshot
+    config = job.get("config_snapshot")
+    if not config:
+        raise HTTPException(status_code=400, detail="Job has no saved configuration")
+    
+    # Enable resume mode
+    if "advanced" not in config:
+        config["advanced"] = {}
+    config["advanced"]["resume"] = True
+    
+    # Start training with this config and job_id
+    return await start_training(config, job_id=job_id)
+
+
+@router.post("/jobs/{job_id}/stop")
+async def stop_job(job_id: str):
+    """Stop a specific job (alias for stop_training with job context)."""
+    global _current_job_id
+    
+    if _current_job_id != job_id:
+        raise HTTPException(status_code=400, detail="This job is not currently running")
+    
+    return await stop_training()
+
+
+def update_current_job_progress(
+    current_epoch: int,
+    current_step: int,
+    total_steps: int,
+    loss: Optional[float] = None,
+    lr: Optional[float] = None
+) -> None:
+    """
+    Update progress for the currently running job.
+    Called from websocket handler when parsing training output.
+    """
+    global _current_job_id
+    
+    if _current_job_id:
+        job_service.update_job_progress(
+            _current_job_id,
+            current_epoch=current_epoch,
+            current_step=current_step,
+            total_steps=total_steps,
+            loss=loss,
+            lr=lr
+        )
+
+
+def mark_current_job_completed(lora_path: Optional[str] = None, final_loss: Optional[float] = None) -> None:
+    """
+    Mark the current job as completed.
+    Called when training finishes successfully.
+    """
+    global _current_job_id
+    
+    if _current_job_id:
+        job_service.update_job_status(
+            _current_job_id,
+            JobStatus.COMPLETED,
+            lora_path=lora_path,
+            final_loss=final_loss
+        )
+        job_service.save_job_log(_current_job_id, "success", "Training completed successfully")
+        _current_job_id = None
+
+
+def mark_current_job_failed(error_message: str) -> None:
+    """
+    Mark the current job as failed.
+    Called when training fails with an error.
+    """
+    global _current_job_id
+    
+    if _current_job_id:
+        job_service.update_job_status(
+            _current_job_id,
+            JobStatus.FAILED,
+            error_message=error_message
+        )
+        job_service.save_job_log(_current_job_id, "error", f"Training failed: {error_message}")
+        _current_job_id = None
+
+
+def get_current_job_id() -> Optional[str]:
+    """Get the current job ID."""
+    return _current_job_id
 
 @router.get("/logs")
 async def get_logs():

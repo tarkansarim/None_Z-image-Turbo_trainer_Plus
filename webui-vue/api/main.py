@@ -11,12 +11,14 @@ from fastapi.responses import FileResponse
 
 from core.config import OUTPUTS_DIR, WEBUI_DIR, PROJECT_ROOT
 from core import state
+from core.database import init_db
+from core import job_service
 
 # Note: Using system Python environment (conda/venv)
 # If you need a specific venv, activate it before running this script
 
 # Import routers
-from routers import training, dataset, system, generation, cache, websocket
+from routers import training, dataset, system, generation, cache, websocket, jobs
 
 app = FastAPI(title="Z-Image Trainer", version="1.0.0")
 
@@ -35,6 +37,7 @@ app.include_router(dataset.router)
 app.include_router(system.router)
 app.include_router(generation.router)
 app.include_router(cache.router)
+app.include_router(jobs.router)
 
 # WebSocket endpoint - 必须在 SPA fallback 之前注册
 from fastapi import WebSocket
@@ -43,10 +46,18 @@ import asyncio
 
 @app.on_event("startup")
 async def startup_event():
-    """应用启动时设置主事件循环引用"""
+    """应用启动时设置主事件循环引用和初始化数据库"""
     loop = asyncio.get_running_loop()
     set_main_loop(loop)
     print("Main event loop registered for WebSocket broadcasts")
+    
+    # Initialize jobs database
+    init_db()
+    
+    # Mark any stale "running" jobs as stopped (server restart recovery)
+    stale_count = job_service.clear_stale_running_jobs()
+    if stale_count > 0:
+        print(f"[Jobs] Marked {stale_count} stale running job(s) as stopped")
 
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):

@@ -55,6 +55,10 @@
               <el-icon><Files /></el-icon>
               <span>LoRA 管理</span>
             </el-menu-item>
+            <el-menu-item index="/jobs">
+              <el-icon><Clock /></el-icon>
+              <span>训练历史</span>
+            </el-menu-item>
           </el-menu>
 
           <!-- 系统状态 -->
@@ -94,7 +98,7 @@ import { useDark } from '@vueuse/core'
 import zhCn from 'element-plus/es/locale/lang/zh-cn'
 import { useSystemStore } from '@/stores/system'
 import { useWebSocketStore } from '@/stores/websocket'
-import { HomeFilled, MagicStick, Files } from '@element-plus/icons-vue'
+import { HomeFilled, MagicStick, Files, Clock } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const isDark = useDark()

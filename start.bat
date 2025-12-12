@@ -19,6 +19,10 @@ echo [Setup Environment]
 set "PYTHON_EXE=%SCRIPT_DIR%python\python.exe"
 set "NODE_EXE=%SCRIPT_DIR%nodejs\node.exe"
 
+:: DELICATE: Do not remove. User/global PYTHONHOME can break embedded Python imports (e.g., uvicorn).
+set "PYTHONHOME="
+set "PYTHONNOUSERSITE="
+
 :: Torch/CUDA library path
 set "TORCH_LIB=%SCRIPT_DIR%python\Lib\site-packages\torch\lib"
 
@@ -178,6 +182,40 @@ echo ==================================================
 :: Change to API directory
 cd /d "%SCRIPT_DIR%webui-vue\api"
 
+:: DELICATE: Do not remove. Prevents sudden No module named uvicorn when deps are missing/partially installed.
+echo [Dependency Check]
+"%PYTHON_EXE%" -c "import uvicorn" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo ==================================================
+    echo %PYTHON_EXE%: No module named uvicorn
+    echo.
+    echo Fix: Installing Python dependencies from requirements.txt...
+    echo ==================================================
+    echo.
+    "%SCRIPT_DIR%python\Scripts\pip.exe" install -r "%SCRIPT_DIR%requirements.txt"
+    if errorlevel 1 (
+        echo.
+        echo ==================================================
+        echo   Dependency install failed. Please run setup.bat and check output.
+        echo ==================================================
+        pause
+        exit /b 1
+    )
+    "%PYTHON_EXE%" -c "import uvicorn" >nul 2>&1
+    if errorlevel 1 (
+        echo.
+        echo ==================================================
+        echo   Still cannot import uvicorn after install.
+        echo   Please run setup.bat and/or open logs for details.
+        echo ==================================================
+        pause
+        exit /b 1
+    )
+)
+echo   uvicorn: [OK]
+echo.
+
 :: Open browser after 2 seconds (background)
 start /b cmd /c "timeout /t 2 /nobreak >nul && start http://localhost:%TRAINER_PORT%"
 
@@ -197,3 +235,6 @@ echo ==================================================
 echo    Server stopped. Exit code: %errorlevel%
 echo ==================================================
 pause
+
+
+
