@@ -213,11 +213,59 @@
             <span class="label">启用分桶</span>
             <span class="value">{{ currentConfig.dataset?.enable_bucket ? '是' : '否' }}</span>
           </div>
+          <div class="preview-item">
+            <span class="label">数据集数量</span>
+            <span class="value">{{ currentConfig.dataset?.datasets?.length ?? 0 }}</span>
+          </div>
+          <div class="preview-item" v-if="['standard', 'frequency', 'style', 'unified'].includes(currentConfig.training?.loss_mode)">
+            <span class="label">损失权重范围</span>
+            <span class="value" :class="{ highlight: currentConfig.training?.loss_scope === 'per_dataset' }">
+              {{ currentConfig.training?.loss_scope === 'per_dataset' ? 'Per Dataset' : 'Global' }}
+            </span>
+          </div>
         </div>
-        <div class="datasets-list" v-if="currentConfig.dataset?.datasets?.length > 0">
-          <div v-for="(ds, idx) in currentConfig.dataset.datasets" :key="idx" class="dataset-tag">
-            <span class="ds-path">{{ getDatasetName(ds.cache_directory) }}</span>
-            <span class="ds-repeat">×{{ ds.num_repeats || 1 }}</span>
+        
+        <!-- Datasets list - expanded view when per_dataset mode -->
+        <div class="datasets-expanded" v-if="currentConfig.dataset?.datasets?.length > 0">
+          <div 
+            v-for="(ds, idx) in currentConfig.dataset.datasets" 
+            :key="idx" 
+            class="dataset-card"
+            :class="{ 'has-custom-loss': currentConfig.training?.loss_scope === 'per_dataset' }"
+          >
+            <div class="dataset-header">
+              <span class="ds-index">#{{ idx + 1 }}</span>
+              <span class="ds-name">{{ getDatasetName(ds.cache_directory) }}</span>
+              <span class="ds-repeat">×{{ ds.num_repeats || 1 }}</span>
+            </div>
+            
+            <!-- Per-dataset loss weights (only show when loss_scope is per_dataset) -->
+            <div class="dataset-loss-params" v-if="currentConfig.training?.loss_scope === 'per_dataset'">
+              <!-- Standard mode params -->
+              <template v-if="currentConfig.training?.loss_mode === 'standard'">
+                <span class="loss-param">FFT: {{ ds.lambda_fft ?? 0 }}</span>
+                <span class="loss-param">Cos: {{ ds.lambda_cosine ?? 0 }}</span>
+              </template>
+              <!-- Frequency mode params -->
+              <template v-if="currentConfig.training?.loss_mode === 'frequency'">
+                <span class="loss-param">α_HF: {{ ds.alpha_hf ?? 1.0 }}</span>
+                <span class="loss-param">β_LF: {{ ds.beta_lf ?? 0.2 }}</span>
+              </template>
+              <!-- Style mode params -->
+              <template v-if="currentConfig.training?.loss_mode === 'style'">
+                <span class="loss-param">Struct: {{ ds.lambda_struct ?? 1.0 }}</span>
+                <span class="loss-param">Light: {{ ds.lambda_light ?? 0 }}</span>
+                <span class="loss-param">Color: {{ ds.lambda_color ?? 0 }}</span>
+                <span class="loss-param">Tex: {{ ds.lambda_tex ?? 0 }}</span>
+              </template>
+              <!-- Unified mode params -->
+              <template v-if="currentConfig.training?.loss_mode === 'unified'">
+                <span class="loss-param">α_HF: {{ ds.alpha_hf ?? 1.0 }}</span>
+                <span class="loss-param">β_LF: {{ ds.beta_lf ?? 0.2 }}</span>
+                <span class="loss-param">Struct: {{ ds.lambda_struct ?? 1.0 }}</span>
+                <span class="loss-param">Light: {{ ds.lambda_light ?? 0 }}</span>
+              </template>
+            </div>
           </div>
         </div>
         <div class="no-datasets" v-else>
@@ -469,6 +517,32 @@ async function startTraining() {
       return
     }
     
+    // 检查分辨率不匹配（缓存存在但分辨率错误）
+    if (response.data.needs_recache) {
+      addLog(`分辨率不匹配: 缓存 ${response.data.cached_resolution}px, 目标 ${response.data.target_resolution}px`, 'warning')
+      
+      try {
+        await ElMessageBox.confirm(
+          `检测到缓存分辨率不匹配：\n\n` +
+          `- 缓存分辨率: ${response.data.cached_resolution}px\n` +
+          `- 目标分辨率: ${response.data.target_resolution}px\n` +
+          `- 受影响文件: ${response.data.mismatch_count}\n\n` +
+          `需要重新生成 Latent 缓存（目标分辨率 ${response.data.target_resolution}px）。\n` +
+          `这将删除现有 Latent 缓存并创建新的。Text 缓存将保留。`,
+          '分辨率不匹配',
+          { confirmButtonText: '重新生成缓存', cancelButtonText: '取消', type: 'warning' }
+        )
+        
+        // 清除旧缓存并重新生成
+        await clearAndRecacheLatents()
+        
+      } catch {
+        addLog('用户取消了重新缓存', 'info')
+        isStarting.value = false
+      }
+      return
+    }
+    
     trainingStore.progress.isRunning = true
     addLog('AC-RF 训练已启动', 'success')
   } catch (error: any) {
@@ -521,6 +595,42 @@ async function generateCacheAndStartTraining() {
     
   } catch (error: any) {
     addLog(`缓存生成失败: ${error.response?.data?.detail || error.message}`, 'error')
+    isStarting.value = false
+  }
+}
+
+async function clearAndRecacheLatents() {
+  if (!currentConfig.value) return
+  
+  const datasets = currentConfig.value.dataset?.datasets || []
+  if (datasets.length === 0) {
+    addLog('没有配置数据集', 'error')
+    isStarting.value = false
+    return
+  }
+  
+  try {
+    // 清除每个数据集的 Latent 缓存（保留 Text 缓存）
+    for (const ds of datasets) {
+      const datasetPath = ds.cache_directory
+      if (!datasetPath) continue
+      
+      addLog(`正在清除 ${datasetPath} 的 Latent 缓存...`, 'info')
+      
+      await axios.post('/api/cache/clear', {
+        datasetPath: datasetPath,
+        clearLatent: true,
+        clearText: false
+      })
+      
+      addLog(`Latent 缓存已清除，将以 ${ds.resolution_limit || 1024}px 分辨率重新生成`, 'info')
+    }
+    
+    // 生成新缓存（只需要 Latent，Text 已存在会跳过）
+    await generateCacheAndStartTraining()
+    
+  } catch (error: any) {
+    addLog(`清除缓存失败: ${error.response?.data?.detail || error.message}`, 'error')
     isStarting.value = false
   }
 }
@@ -961,6 +1071,77 @@ onUnmounted(() => {
     .ds-repeat {
       color: var(--primary);
       font-weight: 600;
+    }
+  }
+  
+  .datasets-expanded {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-sm);
+    margin-top: var(--space-md);
+  }
+  
+  .dataset-card {
+    background: rgba(var(--primary-rgb), 0.05);
+    border: 1px solid rgba(var(--primary-rgb), 0.2);
+    border-radius: var(--radius-md);
+    padding: var(--space-sm) var(--space-md);
+    
+    &.has-custom-loss {
+      background: rgba(var(--primary-rgb), 0.08);
+      border-color: rgba(var(--primary-rgb), 0.3);
+    }
+    
+    .dataset-header {
+      display: flex;
+      align-items: center;
+      gap: var(--space-sm);
+      
+      .ds-index {
+        font-size: 0.7rem;
+        font-weight: 600;
+        color: var(--primary);
+        background: rgba(var(--primary-rgb), 0.15);
+        padding: 2px 6px;
+        border-radius: var(--radius-sm);
+      }
+      
+      .ds-name {
+        flex: 1;
+        font-size: 0.85rem;
+        color: var(--text-secondary);
+        font-weight: 500;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      
+      .ds-repeat {
+        font-size: 0.8rem;
+        font-weight: 600;
+        color: var(--primary);
+        background: rgba(var(--primary-rgb), 0.1);
+        padding: 2px 8px;
+        border-radius: var(--radius-sm);
+      }
+    }
+    
+    .dataset-loss-params {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--space-xs) var(--space-sm);
+      margin-top: var(--space-xs);
+      padding-top: var(--space-xs);
+      border-top: 1px dashed rgba(var(--primary-rgb), 0.2);
+      
+      .loss-param {
+        font-family: var(--font-mono);
+        font-size: 0.7rem;
+        color: var(--text-muted);
+        background: rgba(0, 0, 0, 0.2);
+        padding: 2px 6px;
+        border-radius: 3px;
+      }
     }
   }
   

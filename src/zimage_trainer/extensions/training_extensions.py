@@ -69,8 +69,8 @@ class TrainingExtensions:
         self.accelerator = accelerator
         self.output_name = output_name
         
-        # Initialize checkpoint manager
-        self.ckpt_manager = CheckpointManager(output_dir)
+        # Initialize checkpoint manager with output_name for per-LoRA state files
+        self.ckpt_manager = CheckpointManager(output_dir, output_name)
         
         # Track if we're the main process
         self._is_main = accelerator.is_main_process
@@ -247,8 +247,8 @@ class TrainingExtensions:
             self.save_training_state(optimizer, scheduler, epoch, global_step)
             self.log(f"[SAVE] ✅ 训练状态已保存 (可用于恢复训练)")
         
-        # Synchronize all processes
-        self.accelerator.wait_for_everyone()
+        # NOTE: No barrier here - following OneTrainer's pattern for performance.
+        # Other GPUs continue training while master saves. DDP handles gradient sync.
         
         return save_path
     
@@ -272,8 +272,7 @@ class TrainingExtensions:
         if self._is_main:
             self.save_lora_checkpoint(network, final_path, dtype)
         
-        # Wait for all processes
-        self.accelerator.wait_for_everyone()
+        # NOTE: No barrier here - following OneTrainer's pattern for performance.
         
         return final_path
     

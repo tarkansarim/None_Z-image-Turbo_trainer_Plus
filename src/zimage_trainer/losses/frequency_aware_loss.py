@@ -202,6 +202,86 @@ class FrequencyAwareLoss(nn.Module):
             return total_loss, components
         
         return total_loss
+    
+    # === CUSTOM: Per-sample weighted loss for per-dataset loss settings ===
+    def forward_per_sample(
+        self,
+        pred_v: torch.Tensor,
+        target_v: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        num_train_timesteps: int = 1000,
+        sample_weights: Optional[Dict[str, torch.Tensor]] = None,
+        return_components: bool = False,
+    ) -> torch.Tensor:
+        """
+        计算带有 per-sample 权重的频域感知损失
+        
+        Args:
+            sample_weights: 每个样本的权重，字典包含:
+                - 'alpha_hf': (B,) 高频权重
+                - 'beta_lf': (B,) 低频权重
+        """
+        batch_size = pred_v.shape[0]
+        original_dtype = pred_v.dtype
+        
+        if sample_weights is None:
+            return self.forward(pred_v, target_v, noisy_latents, timesteps, num_train_timesteps, return_components)
+        
+        # 转换为 float32
+        pred_v_fp32 = pred_v.float()
+        target_v_fp32 = target_v.float()
+        noisy_latents_fp32 = noisy_latents.float()
+        
+        # 基础 Loss (per-sample)
+        base_loss_per_sample = F.mse_loss(pred_v_fp32, target_v_fp32, reduction='none').mean(dim=[1, 2, 3])
+        
+        # 计算 sigma
+        sigmas = timesteps.float() / num_train_timesteps
+        sigma_broadcast = sigmas.view(-1, 1, 1, 1)
+        
+        # 反推 x0
+        pred_x0 = noisy_latents_fp32 - sigma_broadcast * pred_v_fp32
+        target_x0 = noisy_latents_fp32 - sigma_broadcast * target_v_fp32
+        
+        # 频域分离
+        pred_low = self.get_low_freq(pred_x0)
+        pred_high = pred_x0 - pred_low
+        target_low = self.get_low_freq(target_x0)
+        target_high = target_x0 - target_low
+        
+        # 高频 Loss (per-sample L1)
+        loss_hf_per_sample = F.l1_loss(pred_high, target_high, reduction='none').mean(dim=[1, 2, 3])
+        
+        # 低频 Loss (per-sample cosine)
+        pred_low_flat = pred_low.view(batch_size, -1)
+        target_low_flat = target_low.view(batch_size, -1)
+        cos_sim_per_sample = F.cosine_similarity(pred_low_flat, target_low_flat, dim=1)
+        loss_lf_per_sample = 1.0 - cos_sim_per_sample
+        
+        # 获取 per-sample 权重
+        w_alpha_hf = sample_weights.get('alpha_hf', torch.ones(batch_size, device=pred_v.device) * self.alpha_hf)
+        w_beta_lf = sample_weights.get('beta_lf', torch.ones(batch_size, device=pred_v.device) * self.beta_lf)
+        
+        # 计算加权 per-sample 损失
+        loss_per_sample = (
+            self.base_weight * base_loss_per_sample +
+            w_alpha_hf * loss_hf_per_sample +
+            w_beta_lf * loss_lf_per_sample
+        )
+        
+        total_loss = loss_per_sample.mean().to(original_dtype)
+        
+        if return_components:
+            components = {
+                "base_loss": base_loss_per_sample.mean().to(original_dtype),
+                "loss_hf": (w_alpha_hf * loss_hf_per_sample).mean().to(original_dtype),
+                "loss_lf": (w_beta_lf * loss_lf_per_sample).mean().to(original_dtype),
+                "total_loss": total_loss,
+            }
+            return total_loss, components
+        
+        return total_loss
 
 
 class AdaptiveFrequencyLoss(FrequencyAwareLoss):

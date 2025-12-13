@@ -240,8 +240,10 @@ class ZImageLatentDataset(Dataset):
         
         self.cache_files = []
         self.resolutions = []
+        # === CUSTOM: Track which dataset each sample came from ===
+        self.dataset_indices = []
         
-        for ds_config in datasets:
+        for ds_idx, ds_config in enumerate(datasets):
             cache_dir = Path(ds_config['cache_directory'])
             repeats = ds_config.get('num_repeats', 1)
             resolution_limit = ds_config.get('resolution_limit', None)
@@ -257,9 +259,17 @@ class ZImageLatentDataset(Dataset):
             
             self.cache_files.extend(files)
             self.resolutions.extend(res_list)
+            # === CUSTOM: Track dataset_idx for each file ===
+            self.dataset_indices.extend([ds_idx] * len(files))
             
         if len(self.cache_files) == 0:
-            raise ValueError("No valid cache files found in any dataset")
+            raise ValueError(
+                "No valid cache files found in any dataset. "
+                "Check the warnings above - common causes:\n"
+                "  1. resolution_limit is too low (all files filtered out)\n"
+                "  2. Cache files don't exist (need to run latent caching first)\n"
+                "  3. Text encoder cache files are missing"
+            )
             
         logger.info(f"Total samples: {len(self.cache_files)}")
     
@@ -272,6 +282,13 @@ class ZImageLatentDataset(Dataset):
         pattern = f"*_{self.LATENT_ARCH}.safetensors"
         latent_files = list(cache_dir.glob(pattern))
         
+        if not latent_files:
+            logger.warning(f"  No latent cache files (*_{self.LATENT_ARCH}.safetensors) found in {cache_dir}")
+            return files, resolutions
+        
+        filtered_by_resolution = 0
+        missing_te_cache = 0
+        
         for latent_path in latent_files:
             # Parse resolution
             res = self._parse_resolution(latent_path.stem)
@@ -280,6 +297,7 @@ class ZImageLatentDataset(Dataset):
             if resolution_limit:
                 h, w = res
                 if max(h, w) > resolution_limit:
+                    filtered_by_resolution += 1
                     continue
             
             # Find text encoder cache
@@ -288,6 +306,16 @@ class ZImageLatentDataset(Dataset):
             if te_path and te_path.exists():
                 files.append((latent_path, te_path))
                 resolutions.append(res)
+            else:
+                missing_te_cache += 1
+        
+        # Log helpful info if files were filtered
+        if filtered_by_resolution > 0:
+            logger.warning(f"  {filtered_by_resolution}/{len(latent_files)} files filtered by resolution_limit={resolution_limit}")
+        if missing_te_cache > 0:
+            logger.warning(f"  {missing_te_cache} files missing text encoder cache")
+        if len(files) > 0:
+            logger.info(f"  Loaded {len(files)} samples from {cache_dir.name}")
             
         return files, resolutions
 
@@ -355,6 +383,8 @@ class ZImageLatentDataset(Dataset):
         return {
             'latents': latents,
             'vl_embed': vl_embed,
+            # === CUSTOM: Include dataset_idx for per-dataset loss weights ===
+            'dataset_idx': self.dataset_indices[idx],
         }
 
 
@@ -447,9 +477,13 @@ def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     
     vl_embeds = [item['vl_embed'] for item in batch]  # 保持 list 形式
     
+    # === CUSTOM: Batch dataset_idx for per-dataset loss weights ===
+    dataset_indices = torch.tensor([item['dataset_idx'] for item in batch], dtype=torch.long)
+    
     return {
         'latents': latents,
         'vl_embed': vl_embeds,
+        'dataset_idx': dataset_indices,
     }
 
 

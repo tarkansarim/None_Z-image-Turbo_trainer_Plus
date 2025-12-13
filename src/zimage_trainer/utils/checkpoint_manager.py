@@ -30,7 +30,7 @@ from typing import Optional, Tuple, Any
 logger = logging.getLogger(__name__)
 
 # State file names
-TRAINING_STATE_FILE = "training_state.pt"
+TRAINING_STATE_FILE = "training_state.pt"  # Legacy fallback
 
 
 class CheckpointManager:
@@ -39,17 +39,29 @@ class CheckpointManager:
     
     Saves optimizer state, scheduler state, epoch, step, and RNG states
     in a single file that gets overwritten each epoch (space efficient).
+    
+    State files are saved per-LoRA name to allow independent resume for different trainings.
     """
     
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir: str, output_name: str = None):
         """
         Initialize checkpoint manager.
         
         Args:
             output_dir: Directory where checkpoints are saved
+            output_name: Base name for the LoRA (used to create per-LoRA state files)
         """
         self.output_dir = Path(output_dir)
-        self.state_path = self.output_dir / TRAINING_STATE_FILE
+        self.output_name = output_name
+        
+        # Per-LoRA state file: training_state_{name}.pt
+        if output_name:
+            self.state_path = self.output_dir / f"training_state_{output_name}.pt"
+            logger.info(f"[CKPT] Using per-LoRA state file: {self.state_path.name}")
+        else:
+            # Fallback to legacy filename if no name provided
+            self.state_path = self.output_dir / TRAINING_STATE_FILE
+            logger.info(f"[CKPT] Using legacy state file: {self.state_path.name}")
         
     def has_resume_state(self) -> bool:
         """Check if a resume state file exists."""
@@ -60,13 +72,16 @@ class CheckpointManager:
         Find the latest LoRA checkpoint file in the output directory.
         
         Args:
-            output_name: Base name of the output files (optional, uses pattern matching if not provided)
+            output_name: Base name of the output files (uses self.output_name if not provided)
             
         Returns:
             Path to the latest LoRA checkpoint, or None if not found
         """
         if not self.output_dir.exists():
             return None
+        
+        # Use provided name or fall back to instance name
+        name_to_match = output_name or self.output_name
         
         # Find all safetensors files that look like checkpoints
         # Pattern: {name}_epoch{N}.safetensors or {name}_final.safetensors
@@ -75,6 +90,11 @@ class CheckpointManager:
         for f in self.output_dir.glob("*.safetensors"):
             # Skip files that don't look like our checkpoints
             name = f.stem
+            
+            # If we have a specific name to match, only consider files starting with that name
+            if name_to_match:
+                if not name.startswith(name_to_match):
+                    continue
             
             # Match epoch checkpoints: name_epoch123
             epoch_match = re.search(r'_epoch(\d+)$', name)
@@ -87,13 +107,15 @@ class CheckpointManager:
                 checkpoint_files.append((f, float('inf'), True))
         
         if not checkpoint_files:
+            if name_to_match:
+                logger.info(f"[CKPT] No checkpoints found for '{name_to_match}'")
             return None
         
         # Sort by epoch number (final = infinity, so it comes last)
         checkpoint_files.sort(key=lambda x: x[1], reverse=True)
         latest = checkpoint_files[0][0]
         
-        logger.info(f"[CKPT] Found latest LoRA checkpoint: {latest.name}")
+        logger.info(f"[CKPT] Found latest LoRA checkpoint for '{name_to_match}': {latest.name}")
         return latest
     
     def save_training_state(
@@ -127,12 +149,12 @@ class CheckpointManager:
         }
         
         # For distributed training, only save on main process
+        # NOTE: No barrier after save - following OneTrainer's pattern for performance.
+        # Other GPUs continue training while master saves. DDP handles gradient sync.
         if accelerator is not None:
             if accelerator.is_main_process:
                 torch.save(state, self.state_path)
                 logger.info(f"[CKPT] Saved training state: epoch={epoch+1}, step={global_step}")
-            # Ensure all processes wait for save to complete
-            accelerator.wait_for_everyone()
         else:
             torch.save(state, self.state_path)
             logger.info(f"[CKPT] Saved training state: epoch={epoch+1}, step={global_step}")

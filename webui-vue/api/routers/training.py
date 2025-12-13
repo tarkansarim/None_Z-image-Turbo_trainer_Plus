@@ -271,7 +271,10 @@ async def get_training_presets():
     return {"presets": presets}
 
 def check_dataset_cache(config: Dict[str, Any]) -> Dict[str, Any]:
-    """检查数据集缓存状态（同步函数）"""
+    """检查数据集缓存状态（同步函数）
+    
+    Also detects resolution mismatches between cached latents and target resolution.
+    """
     dataset_cfg = config.get("dataset", {})
     datasets = dataset_cfg.get("datasets", [])
     
@@ -284,12 +287,22 @@ def check_dataset_cache(config: Dict[str, Any]) -> Dict[str, Any]:
             "latent_cached": 0,
             "text_cached": 0,
             "latent_missing": 0,
-            "text_missing": 0
+            "text_missing": 0,
+            "needs_recache": False,
+            "target_resolution": None,
+            "cached_resolution": None,
+            "mismatch_count": 0
         }
     
     total_images = 0
     latent_cached = 0
     text_cached = 0
+    
+    # Resolution mismatch detection
+    cached_resolutions = []
+    target_resolution = None
+    resolution_mismatch = False
+    mismatch_count = 0
     
     image_extensions = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
     
@@ -302,6 +315,11 @@ def check_dataset_cache(config: Dict[str, Any]) -> Dict[str, Any]:
         if not dataset_path.exists():
             continue
         
+        # Get target resolution for this dataset
+        ds_target_res = ds.get("resolution_limit", 1024)
+        if target_resolution is None:
+            target_resolution = ds_target_res
+        
         # 统计图片和缓存
         for f in dataset_path.rglob("*"):
             if f.is_file() and f.suffix.lower() in image_extensions:
@@ -310,8 +328,22 @@ def check_dataset_cache(config: Dict[str, Any]) -> Dict[str, Any]:
                 parent = f.parent
                 
                 # 检查 latent 缓存
-                if list(parent.glob(f"{stem}_*_zi.safetensors")):
+                latent_files = list(parent.glob(f"{stem}_*_zi.safetensors"))
+                if latent_files:
                     latent_cached += 1
+                    
+                    # Parse resolution from cache filename (e.g., "image_1024x768_zi.safetensors")
+                    for latent_file in latent_files:
+                        match = re.search(r'_(\d+)x(\d+)_zi\.safetensors$', latent_file.name)
+                        if match:
+                            w, h = int(match.group(1)), int(match.group(2))
+                            max_dim = max(w, h)
+                            cached_resolutions.append(max_dim)
+                            
+                            # Check if this cache would be filtered out by resolution_limit
+                            if max_dim > ds_target_res:
+                                resolution_mismatch = True
+                                mismatch_count += 1
                 
                 # 检查 text 缓存 (格式: {name}_zi_te.safetensors)
                 if list(parent.glob(f"{stem}_zi_te.safetensors")):
@@ -319,13 +351,21 @@ def check_dataset_cache(config: Dict[str, Any]) -> Dict[str, Any]:
     
     has_cache = latent_cached > 0 and text_cached > 0
     
+    # Determine the most common cached resolution
+    cached_resolution = max(cached_resolutions) if cached_resolutions else None
+    
     return {
         "has_cache": has_cache,
         "total_images": total_images,
         "latent_cached": latent_cached,
         "text_cached": text_cached,
         "latent_missing": total_images - latent_cached,
-        "text_missing": total_images - text_cached
+        "text_missing": total_images - text_cached,
+        # Resolution mismatch info
+        "needs_recache": resolution_mismatch,
+        "target_resolution": target_resolution,
+        "cached_resolution": cached_resolution,
+        "mismatch_count": mismatch_count
     }
 
 
@@ -417,6 +457,23 @@ async def start_training(config: Dict[str, Any], job_id: Optional[str] = None):
                 "latent_missing": cache_info["latent_missing"],
                 "text_missing": cache_info["text_missing"],
                 "message": f"缓存不完整，需要先生成缓存"
+            }
+        
+        # Check for resolution mismatch (cache exists but at wrong resolution)
+        if cache_info.get("needs_recache"):
+            state.add_log(
+                f"分辨率不匹配: 缓存 {cache_info['cached_resolution']}px, 目标 {cache_info['target_resolution']}px, "
+                f"受影响文件: {cache_info['mismatch_count']}", 
+                "warning"
+            )
+            return {
+                "success": False,
+                "needs_recache": True,
+                "target_resolution": cache_info["target_resolution"],
+                "cached_resolution": cache_info["cached_resolution"],
+                "mismatch_count": cache_info["mismatch_count"],
+                "total_images": cache_info["total_images"],
+                "message": f"缓存分辨率 {cache_info['cached_resolution']}px 与目标 {cache_info['target_resolution']}px 不匹配"
             }
         
         state.add_log(f"缓存检查通过: {cache_info['latent_cached']} latent, {cache_info['text_cached']} text", "info")

@@ -417,4 +417,118 @@ class LatentStyleStructureLoss(StyleStructureLoss):
             return total_loss, components
         
         return total_loss
+    
+    # === CUSTOM: Per-sample weighted loss for per-dataset loss settings ===
+    def forward_per_sample(
+        self,
+        pred_v: torch.Tensor,
+        target_v: torch.Tensor,
+        noisy_latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        num_train_timesteps: int = 1000,
+        sample_weights: Optional[Dict[str, torch.Tensor]] = None,
+        return_components: bool = False,
+    ) -> torch.Tensor | Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        计算带有 per-sample 权重的风格结构损失
+        
+        Args:
+            pred_v: 模型预测的速度 v (B, C, H, W)
+            target_v: 目标速度 v
+            noisy_latents: 加噪后的 latents x_t
+            timesteps: 时间步
+            sample_weights: 每个样本的权重，字典包含:
+                - 'lambda_struct': (B,) 结构锁权重
+                - 'lambda_light': (B,) 光影学习权重
+                - 'lambda_color': (B,) 色调迁移权重
+                - 'lambda_tex': (B,) 质感增强权重
+        """
+        batch_size = pred_v.shape[0]
+        original_dtype = pred_v.dtype
+        
+        # 如果没有提供权重，使用默认权重
+        if sample_weights is None:
+            return self.forward(pred_v, target_v, noisy_latents, timesteps, num_train_timesteps, return_components)
+        
+        # 转换为 float32 进行计算
+        pred_v_fp32 = pred_v.float()
+        target_v_fp32 = target_v.float()
+        noisy_latents_fp32 = noisy_latents.float()
+        
+        # 基础 loss (per-sample MSE)
+        loss_base_per_sample = F.mse_loss(pred_v_fp32, target_v_fp32, reduction='none').mean(dim=[1, 2, 3])
+        
+        # 计算 sigma
+        sigmas = timesteps.float() / num_train_timesteps
+        sigma_broadcast = sigmas.view(-1, 1, 1, 1)
+        
+        # 反推 x0
+        pred_x0 = noisy_latents_fp32 - sigma_broadcast * pred_v_fp32
+        target_x0 = noisy_latents_fp32 - sigma_broadcast * target_v_fp32
+        
+        # 分离通道
+        pred_L = pred_x0[:, 0:1]
+        target_L = target_x0[:, 0:1]
+        pred_color = pred_x0[:, 1:4]
+        target_color = target_x0[:, 1:4]
+        
+        # 1. 结构锁 (per-sample cosine similarity)
+        pred_L_flat = pred_L.view(batch_size, -1)
+        target_L_flat = target_L.view(batch_size, -1)
+        cos_sim_per_sample = F.cosine_similarity(pred_L_flat, target_L_flat, dim=1)
+        loss_struct_per_sample = 1.0 - cos_sim_per_sample  # (B,)
+        
+        # 2. 光影学习 (per-sample moments loss)
+        pred_L_mean = pred_L.view(batch_size, -1).mean(dim=1)
+        target_L_mean = target_L.view(batch_size, -1).mean(dim=1)
+        pred_L_std = pred_L.view(batch_size, -1).std(dim=1)
+        target_L_std = target_L.view(batch_size, -1).std(dim=1)
+        loss_light_per_sample = (pred_L_mean - target_L_mean).abs() + (pred_L_std - target_L_std).abs()
+        
+        # 3. 色调迁移 (per-sample moments loss)
+        pred_color_mean = pred_color.view(batch_size, 3, -1).mean(dim=2)  # (B, 3)
+        target_color_mean = target_color.view(batch_size, 3, -1).mean(dim=2)
+        pred_color_std = pred_color.view(batch_size, 3, -1).std(dim=2)
+        target_color_std = target_color.view(batch_size, 3, -1).std(dim=2)
+        loss_color_per_sample = ((pred_color_mean - target_color_mean).abs() + 
+                                  (pred_color_std - target_color_std).abs()).mean(dim=1)  # (B,)
+        
+        # 4. 质感增强 (per-sample high freq L1)
+        pred_low = self.get_low_freq_latent(pred_L)
+        target_low = self.get_low_freq_latent(target_L)
+        pred_high = pred_L - pred_low
+        target_high = target_L - target_low
+        loss_tex_per_sample = F.l1_loss(pred_high, target_high, reduction='none').mean(dim=[1, 2, 3])  # (B,)
+        
+        # 获取 per-sample 权重
+        w_struct = sample_weights.get('lambda_struct', torch.ones(batch_size, device=pred_v.device))
+        w_light = sample_weights.get('lambda_light', torch.zeros(batch_size, device=pred_v.device))
+        w_color = sample_weights.get('lambda_color', torch.zeros(batch_size, device=pred_v.device))
+        w_tex = sample_weights.get('lambda_tex', torch.zeros(batch_size, device=pred_v.device))
+        
+        # 计算加权 per-sample 损失
+        loss_per_sample = (
+            self.lambda_base * loss_base_per_sample +
+            w_struct * loss_struct_per_sample +
+            w_light * loss_light_per_sample +
+            w_color * loss_color_per_sample +
+            w_tex * loss_tex_per_sample
+        )
+        
+        # 平均
+        total_loss = loss_per_sample.mean().to(original_dtype)
+        
+        if return_components:
+            components = {
+                "loss_base": loss_base_per_sample.mean().to(original_dtype),
+                "loss_struct": (w_struct * loss_struct_per_sample).mean().to(original_dtype),
+                "loss_light": (w_light * loss_light_per_sample).mean().to(original_dtype),
+                "loss_color": (w_color * loss_color_per_sample).mean().to(original_dtype),
+                "loss_tex": (w_tex * loss_tex_per_sample).mean().to(original_dtype),
+                "cos_sim": cos_sim_per_sample.mean().to(original_dtype),
+                "total_loss": total_loss,
+            }
+            return total_loss, components
+        
+        return total_loss
 

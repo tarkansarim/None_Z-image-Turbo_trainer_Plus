@@ -55,8 +55,16 @@ datasets/
 
 # Output
 output/
+outputs/
 logs/
 *.log
+
+# Local databases / runtime state
+jobs.db
+*.db
+
+# Local training presets (user-specific)
+configs/*.json
 
 # Cache
 .cache/

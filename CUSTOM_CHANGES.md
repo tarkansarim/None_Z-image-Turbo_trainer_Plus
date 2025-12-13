@@ -13,6 +13,7 @@ This document tracks all custom modifications made to this fork for easy re-merg
 | Training Extensions | 1 import + 8 lines | Easy |
 | Multi-GPU Backend | 2 functions | Easy (additive) |
 | Multi-GPU Frontend | 1 new file + 2 lines | Easy |
+| Per-Dataset Loss | 5 files | Medium (additive logic) |
 
 ---
 
@@ -220,17 +221,86 @@ Added atexit and signal handlers to cleanup child processes on exit.
 
 ---
 
+## 8. Per-Dataset Loss Settings
+
+Allows each dataset to have its own loss weights (lambda_struct, lambda_light, lambda_color, lambda_tex) instead of a single global setting.
+
+### Modified: `webui-vue/src/views/TrainingConfig.vue`
+
+**Changes:**
+1. Added `loss_scope` radio group (after loss_mode selector):
+```vue
+<!-- === CUSTOM: Loss Scope Switch (Global vs Per-Dataset) === -->
+<el-radio-group v-model="config.training.loss_scope">
+  <el-radio label="global">Global (全局)</el-radio>
+  <el-radio label="per_dataset">Per Dataset (按数据集)</el-radio>
+</el-radio-group>
+```
+
+2. Added `loss_scope: 'global'` to `getDefaultConfig()`:
+```typescript
+loss_scope: 'global',
+```
+
+3. Added per-dataset loss controls in dataset items (conditionally shown):
+```vue
+<template v-if="config.training.loss_scope === 'per_dataset' && ['style', 'unified'].includes(config.training.loss_mode)">
+  <!-- lambda_struct, lambda_light, lambda_color, lambda_tex sliders -->
+</template>
+```
+
+4. Added default loss weights to `addDatasetFromCache()` and `addDataset()`:
+```typescript
+lambda_struct: 1.0,
+lambda_light: 0.0,
+lambda_color: 0.0,
+lambda_tex: 0.0
+```
+
+### Modified: `webui-vue/api/routers/training.py`
+
+**Function:** `generate_acrf_toml_config()`
+
+**Changes:**
+1. Added `loss_scope` to TOML output
+2. Added per-dataset loss weights when `loss_scope == 'per_dataset'`
+
+### Modified: `src/zimage_trainer/dataset/dataloader.py`
+
+**Changes:**
+1. `ZImageLatentDataset.__init__`: Track `dataset_indices` for each sample
+2. `ZImageLatentDataset.__getitem__`: Return `dataset_idx` in output dict
+3. `collate_fn`: Batch `dataset_idx` as tensor
+
+### Modified: `src/zimage_trainer/losses/style_structure_loss.py`
+
+**Added:** `forward_per_sample()` method to `LatentStyleStructureLoss` class
+- Computes loss per-sample with custom weights instead of batch-averaging
+- Used when `loss_scope == 'per_dataset'`
+
+### Modified: `scripts/train_acrf.py`
+
+**Changes:**
+1. Added `--loss_scope` argument
+2. Added `args.datasets_loss_weights` parsing from config
+3. Modified 'style' and 'unified' loss computation to use `forward_per_sample()` when per-dataset mode is enabled
+
+---
+
 ## Quick Re-Merge Checklist
 
 After pulling upstream changes:
 
-1. [ ] Check if `train_acrf.py` has conflicts → re-apply the ~8 lines above
+1. [ ] Check if `train_acrf.py` has conflicts → re-apply the ~8 lines above + per-dataset loss logic
 2. [ ] Check if `websocket.py` / `system.py` `get_gpu_info()` changed → re-apply multi-GPU logic
 3. [ ] Check if `Monitor.vue` changed → re-add MultiGpuMonitor import + avgStepTime fix
-4. [ ] Check if `TrainingConfig.vue` changed → re-add resume/multi-GPU UI section
+4. [ ] Check if `TrainingConfig.vue` changed → re-add resume/multi-GPU UI + per-dataset loss UI
 5. [ ] Check if `websocket.ts` changed → re-add sessionStartStep tracking
 6. [ ] Check if `training.ts` changed → re-add sessionStartStep/stepsThisSession fields
-7. [ ] New files in `extensions/`, `components/`, `scripts/train_multi_gpu.py` → no action needed
+7. [ ] Check if `dataloader.py` changed → re-add dataset_idx tracking
+8. [ ] Check if `style_structure_loss.py` changed → re-add `forward_per_sample()` method
+9. [ ] Check if `training.py` changed → re-add loss_scope to TOML generation
+10. [ ] New files in `extensions/`, `components/`, `scripts/train_multi_gpu.py` → no action needed
 
 ---
 

@@ -90,6 +90,10 @@ def parse_args():
     parser.add_argument("--loss_mode", type=str, default="standard",
         choices=["standard", "frequency", "style", "unified"],
         help="损失模式: standard=基础MSE, frequency=频域感知, style=风格结构, unified=统一模式")
+    # === CUSTOM: Loss scope (global vs per_dataset) ===
+    parser.add_argument("--loss_scope", type=str, default="global",
+        choices=["global", "per_dataset"],
+        help="损失权重范围: global=所有数据集使用相同权重, per_dataset=每个数据集使用自己的权重")
     
     # 频域感知 Loss 参数 (loss_mode=frequency 或 unified)
     parser.add_argument("--alpha_hf", type=float, default=1.0, help="高频增强权重 (频域模式)")
@@ -222,6 +226,37 @@ def parse_args():
     # dataset_config 可选：如果没有指定，使用主配置文件
     if not args.dataset_config and args.config:
         args.dataset_config = args.config  # 使用主配置文件中的 [dataset] 部分
+    
+    # === CUSTOM: Read datasets config for per-dataset loss weights ===
+    args.datasets_loss_weights = []
+    if args.config and hasattr(args, 'loss_scope') and args.loss_scope == 'per_dataset':
+        import tomli
+        with open(args.config, "rb") as f:
+            full_config = tomli.load(f)
+        dataset_section = full_config.get('dataset', {})
+        sources = dataset_section.get('sources', [])
+        print(f"[PER-DATASET] Loss scope: per_dataset, found {len(sources)} dataset(s)", flush=True)
+        for idx, ds in enumerate(sources):
+            weights = {
+                # Standard mode params
+                'lambda_fft': ds.get('lambda_fft', 0.0),
+                'lambda_cosine': ds.get('lambda_cosine', 0.0),
+                # Frequency mode params
+                'alpha_hf': ds.get('alpha_hf', 1.0),
+                'beta_lf': ds.get('beta_lf', 0.2),
+                # Style mode params
+                'lambda_struct': ds.get('lambda_struct', 1.0),
+                'lambda_light': ds.get('lambda_light', 0.0),
+                'lambda_color': ds.get('lambda_color', 0.0),
+                'lambda_tex': ds.get('lambda_tex', 0.0),
+            }
+            args.datasets_loss_weights.append(weights)
+            print(f"[PER-DATASET] Dataset {idx}: fft={weights['lambda_fft']:.2f} cos={weights['lambda_cosine']:.2f} "
+                  f"hf={weights['alpha_hf']:.2f} lf={weights['beta_lf']:.2f} "
+                  f"struct={weights['lambda_struct']:.2f} light={weights['lambda_light']:.2f} "
+                  f"color={weights['lambda_color']:.2f} tex={weights['lambda_tex']:.2f}", flush=True)
+    else:
+        print(f"[PER-DATASET] Loss scope: global (using global weights for all datasets)", flush=True)
         
     return args
 
@@ -453,7 +488,11 @@ def main():
     
     # 3.6. 创建高级损失函数 (根据 loss_mode)
     loss_mode = getattr(args, 'loss_mode', 'standard')
+    loss_scope = getattr(args, 'loss_scope', 'global')
     logger.info(f"\n[LOSS] 损失模式: {loss_mode}")
+    logger.info(f"[LOSS] 损失范围: {loss_scope}")
+    if loss_scope == 'per_dataset':
+        logger.info(f"[LOSS] *** PER-DATASET MODE ACTIVE - each dataset uses its own loss weights ***")
     
     frequency_loss_fn = None
     style_loss_fn = None
@@ -560,6 +599,34 @@ def main():
     # 8. 训练循环
     ext.log_training_start(start_epoch, global_step, args.num_train_epochs)
     
+    # === CUSTOM: Pre-build per-dataset weight tensors for fast GPU indexing ===
+    # This avoids slow Python loops during training
+    per_dataset_weights = None
+    if args.loss_scope == 'per_dataset' and args.datasets_loss_weights:
+        num_datasets = len(args.datasets_loss_weights)
+        per_dataset_weights = {
+            # Standard mode
+            'lambda_fft': torch.tensor([w['lambda_fft'] for w in args.datasets_loss_weights], 
+                                       device=accelerator.device, dtype=weight_dtype),
+            'lambda_cosine': torch.tensor([w['lambda_cosine'] for w in args.datasets_loss_weights], 
+                                          device=accelerator.device, dtype=weight_dtype),
+            # Frequency mode
+            'alpha_hf': torch.tensor([w['alpha_hf'] for w in args.datasets_loss_weights], 
+                                     device=accelerator.device, dtype=weight_dtype),
+            'beta_lf': torch.tensor([w['beta_lf'] for w in args.datasets_loss_weights], 
+                                    device=accelerator.device, dtype=weight_dtype),
+            # Style mode
+            'lambda_struct': torch.tensor([w['lambda_struct'] for w in args.datasets_loss_weights], 
+                                          device=accelerator.device, dtype=weight_dtype),
+            'lambda_light': torch.tensor([w['lambda_light'] for w in args.datasets_loss_weights], 
+                                         device=accelerator.device, dtype=weight_dtype),
+            'lambda_color': torch.tensor([w['lambda_color'] for w in args.datasets_loss_weights], 
+                                         device=accelerator.device, dtype=weight_dtype),
+            'lambda_tex': torch.tensor([w['lambda_tex'] for w in args.datasets_loss_weights], 
+                                       device=accelerator.device, dtype=weight_dtype),
+        }
+        logger.info(f"[PER-DATASET] Pre-built {num_datasets} weight tensors on {accelerator.device}")
+    
     # 禁用 tqdm 显示，改用 [STEP] 格式输出（避免日志重复）
     progress_bar = tqdm(total=args.max_train_steps, desc="Training", disable=True)
     
@@ -631,29 +698,76 @@ def main():
                 
                 if loss_mode == 'standard':
                     # 标准模式：使用 AC-RF 原生损失（内部也会应用 SNR 加权）
-                    loss = acrf_trainer.compute_loss(
-                        model_output=model_pred,
-                        target_velocity=target_velocity,
-                        latents_noisy=noisy_latents,
-                        timesteps=timesteps,
-                        target_x0=latents,
-                        lambda_fft=args.lambda_fft,
-                        lambda_cosine=args.lambda_cosine,
-                        snr_gamma=snr_gamma,
-                        snr_floor=snr_floor,
-                    )
+                    # === CUSTOM: Per-dataset loss weights (OPTIMIZED with tensor indexing) ===
+                    if args.loss_scope == 'per_dataset' and per_dataset_weights is not None:
+                        # Debug: Log first time per-dataset is used
+                        if global_step == 0 and step == 0:
+                            print(f"[PER-DATASET] Using per-sample weights for STANDARD mode (optimized)", flush=True)
+                        
+                        # Fast GPU tensor indexing - no Python loops!
+                        dataset_indices = batch['dataset_idx'].to(accelerator.device)
+                        sample_weights = {
+                            'lambda_fft': per_dataset_weights['lambda_fft'][dataset_indices],
+                            'lambda_cosine': per_dataset_weights['lambda_cosine'][dataset_indices],
+                        }
+                        
+                        loss = acrf_trainer.compute_loss_per_sample(
+                            model_output=model_pred,
+                            target_velocity=target_velocity,
+                            latents_noisy=noisy_latents,
+                            timesteps=timesteps,
+                            target_x0=latents,
+                            sample_weights=sample_weights,
+                            snr_gamma=snr_gamma,
+                            snr_floor=snr_floor,
+                        )
+                    else:
+                        loss = acrf_trainer.compute_loss(
+                            model_output=model_pred,
+                            target_velocity=target_velocity,
+                            latents_noisy=noisy_latents,
+                            timesteps=timesteps,
+                            target_x0=latents,
+                            lambda_fft=args.lambda_fft,
+                            lambda_cosine=args.lambda_cosine,
+                            snr_gamma=snr_gamma,
+                            snr_floor=snr_floor,
+                        )
                     loss_components['base'] = loss.item()
                     
                 elif loss_mode == 'frequency':
                     # 频域感知模式
-                    loss, comps = frequency_loss_fn(
-                        pred_v=model_pred,
-                        target_v=target_velocity,
-                        noisy_latents=noisy_latents,
-                        timesteps=timesteps,
-                        num_train_timesteps=1000,
-                        return_components=True,
-                    )
+                    # === CUSTOM: Per-dataset loss weights (OPTIMIZED with tensor indexing) ===
+                    if args.loss_scope == 'per_dataset' and per_dataset_weights is not None:
+                        # Debug: Log first time per-dataset is used
+                        if global_step == 0 and step == 0:
+                            print(f"[PER-DATASET] Using per-sample weights for FREQUENCY mode (optimized)", flush=True)
+                        
+                        # Fast GPU tensor indexing - no Python loops!
+                        dataset_indices = batch['dataset_idx'].to(accelerator.device)
+                        sample_weights = {
+                            'alpha_hf': per_dataset_weights['alpha_hf'][dataset_indices],
+                            'beta_lf': per_dataset_weights['beta_lf'][dataset_indices],
+                        }
+                        
+                        loss, comps = frequency_loss_fn.forward_per_sample(
+                            pred_v=model_pred,
+                            target_v=target_velocity,
+                            noisy_latents=noisy_latents,
+                            timesteps=timesteps,
+                            num_train_timesteps=1000,
+                            sample_weights=sample_weights,
+                            return_components=True,
+                        )
+                    else:
+                        loss, comps = frequency_loss_fn(
+                            pred_v=model_pred,
+                            target_v=target_velocity,
+                            noisy_latents=noisy_latents,
+                            timesteps=timesteps,
+                            num_train_timesteps=1000,
+                            return_components=True,
+                        )
                     # 应用 Min-SNR 加权
                     if snr_weights is not None:
                         loss = loss * snr_weights.mean()
@@ -661,14 +775,39 @@ def main():
                     
                 elif loss_mode == 'style':
                     # 风格结构模式
-                    loss, comps = style_loss_fn(
-                        pred_v=model_pred,
-                        target_v=target_velocity,
-                        noisy_latents=noisy_latents,
-                        timesteps=timesteps,
-                        num_train_timesteps=1000,
-                        return_components=True,
-                    )
+                    # === CUSTOM: Per-dataset loss weights (OPTIMIZED with tensor indexing) ===
+                    if args.loss_scope == 'per_dataset' and per_dataset_weights is not None:
+                        # Debug: Log first time per-dataset is used
+                        if global_step == 0 and step == 0:
+                            print(f"[PER-DATASET] Using per-sample weights for STYLE mode (optimized)", flush=True)
+                        
+                        # Fast GPU tensor indexing - no Python loops!
+                        dataset_indices = batch['dataset_idx'].to(accelerator.device)
+                        sample_weights = {
+                            'lambda_struct': per_dataset_weights['lambda_struct'][dataset_indices],
+                            'lambda_light': per_dataset_weights['lambda_light'][dataset_indices],
+                            'lambda_color': per_dataset_weights['lambda_color'][dataset_indices],
+                            'lambda_tex': per_dataset_weights['lambda_tex'][dataset_indices],
+                        }
+                        
+                        loss, comps = style_loss_fn.forward_per_sample(
+                            pred_v=model_pred,
+                            target_v=target_velocity,
+                            noisy_latents=noisy_latents,
+                            timesteps=timesteps,
+                            num_train_timesteps=1000,
+                            sample_weights=sample_weights,
+                            return_components=True,
+                        )
+                    else:
+                        loss, comps = style_loss_fn(
+                            pred_v=model_pred,
+                            target_v=target_velocity,
+                            noisy_latents=noisy_latents,
+                            timesteps=timesteps,
+                            num_train_timesteps=1000,
+                            return_components=True,
+                        )
                     # 应用 Min-SNR 加权
                     if snr_weights is not None:
                         loss = loss * snr_weights.mean()
@@ -684,14 +823,39 @@ def main():
                         num_train_timesteps=1000,
                         return_components=True,
                     )
-                    style_loss, style_comps = style_loss_fn(
-                        pred_v=model_pred,
-                        target_v=target_velocity,
-                        noisy_latents=noisy_latents,
-                        timesteps=timesteps,
-                        num_train_timesteps=1000,
-                        return_components=True,
-                    )
+                    # === CUSTOM: Per-dataset loss weights for style part (OPTIMIZED) ===
+                    if args.loss_scope == 'per_dataset' and per_dataset_weights is not None:
+                        # Debug: Log first time per-dataset is used
+                        if global_step == 0 and step == 0:
+                            print(f"[PER-DATASET] Using per-sample weights for UNIFIED mode (optimized)", flush=True)
+                        
+                        # Fast GPU tensor indexing - no Python loops!
+                        dataset_indices = batch['dataset_idx'].to(accelerator.device)
+                        sample_weights = {
+                            'lambda_struct': per_dataset_weights['lambda_struct'][dataset_indices],
+                            'lambda_light': per_dataset_weights['lambda_light'][dataset_indices],
+                            'lambda_color': per_dataset_weights['lambda_color'][dataset_indices],
+                            'lambda_tex': per_dataset_weights['lambda_tex'][dataset_indices],
+                        }
+                        
+                        style_loss, style_comps = style_loss_fn.forward_per_sample(
+                            pred_v=model_pred,
+                            target_v=target_velocity,
+                            noisy_latents=noisy_latents,
+                            timesteps=timesteps,
+                            num_train_timesteps=1000,
+                            sample_weights=sample_weights,
+                            return_components=True,
+                        )
+                    else:
+                        style_loss, style_comps = style_loss_fn(
+                            pred_v=model_pred,
+                            target_v=target_velocity,
+                            noisy_latents=noisy_latents,
+                            timesteps=timesteps,
+                            num_train_timesteps=1000,
+                            return_components=True,
+                        )
                     # 取两个 loss 的平均
                     loss = (freq_loss + style_loss) / 2
                     # 应用 Min-SNR 加权

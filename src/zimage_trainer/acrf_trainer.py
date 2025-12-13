@@ -244,6 +244,72 @@ class ACRFTrainer:
         )
         
         return total_loss
+    
+    # === CUSTOM: Per-sample weighted loss for per-dataset loss settings ===
+    def compute_loss_per_sample(
+        self,
+        model_output: torch.Tensor,
+        target_velocity: torch.Tensor,
+        latents_noisy: torch.Tensor,
+        timesteps: torch.Tensor,
+        target_x0: torch.Tensor,
+        sample_weights: dict = None,
+        snr_gamma: float = 5.0,
+        snr_floor: float = 0.1,
+    ) -> torch.Tensor:
+        """
+        计算带有 per-sample 权重的标准损失
+        
+        Args:
+            sample_weights: 每个样本的权重，字典包含:
+                - 'lambda_fft': (B,) FFT损失权重
+                - 'lambda_cosine': (B,) 余弦损失权重
+        """
+        batch_size = model_output.shape[0]
+        
+        if sample_weights is None:
+            # 使用全局默认值
+            return self.compute_loss(
+                model_output, target_velocity, latents_noisy, timesteps, target_x0,
+                lambda_fft=0.1, lambda_cosine=0.1, snr_gamma=snr_gamma, snr_floor=snr_floor
+            )
+        
+        # 计算 SNR 权重 (可选)
+        if snr_gamma > 0:
+            snr_weight = self._compute_snr_weight(timesteps, snr_gamma, snr_floor)
+        else:
+            snr_weight = 1.0
+        
+        # 1. Charbonnier Loss (per-sample)
+        diff = model_output - target_velocity
+        loss_per_sample = torch.sqrt(diff**2 + 1e-6)
+        loss_charbonnier_per_sample = (loss_per_sample * snr_weight).mean(dim=[1, 2, 3])  # (B,)
+        
+        # 2. Cosine Loss (per-sample)
+        pred_flat = model_output.view(batch_size, -1)
+        target_flat = target_velocity.view(batch_size, -1)
+        cos_sim_per_sample = F.cosine_similarity(pred_flat, target_flat, dim=1)
+        loss_cosine_per_sample = 1.0 - cos_sim_per_sample  # (B,)
+        
+        # 3. FFT Loss (per-sample)
+        # Match the behavior of _compute_fft_loss() but return per-sample values so we can weight by dataset.
+        sigmas = timesteps.float() / float(self.num_train_timesteps)
+        sigmas_broad = sigmas.view(-1, 1, 1, 1)
+        pred_x0 = latents_noisy - sigmas_broad * model_output
+        loss_fft_per_sample = self._compute_fft_loss_per_sample(pred_x0, target_x0)
+        
+        # 获取 per-sample 权重
+        w_fft = sample_weights.get('lambda_fft', torch.zeros(batch_size, device=model_output.device))
+        w_cosine = sample_weights.get('lambda_cosine', torch.zeros(batch_size, device=model_output.device))
+        
+        # 计算加权损失
+        total_loss_per_sample = (
+            1.0 * loss_charbonnier_per_sample +
+            w_cosine * loss_cosine_per_sample +
+            w_fft * loss_fft_per_sample
+        )
+        
+        return total_loss_per_sample.mean()
 
     def _compute_fft_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -315,6 +381,67 @@ class ACRFTrainer:
             if "powers of two" in str(e) or "cuFFT" in str(e):
                 logger.debug(f"FFT loss disabled for dimensions {H}x{W}: {e}")
                 return torch.tensor(0.0, device=pred.device, dtype=original_dtype)
+            else:
+                raise
+
+    def _compute_fft_loss_per_sample(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Per-sample version of _compute_fft_loss().
+
+        Returns:
+            Tensor of shape (B,) with one FFT loss value per sample.
+        """
+        if pred.dim() == 3:
+            pred = pred.unsqueeze(0)
+        if target.dim() == 3:
+            target = target.unsqueeze(0)
+
+        B, C, H, W = pred.shape
+        original_dtype = pred.dtype
+        pred_fp32 = pred.float()
+        target_fp32 = target.float()
+
+        try:
+            # 1. 2D FFT + shift (零频移到中心)
+            pred_fft = torch.fft.fft2(pred_fp32, norm='ortho')
+            target_fft = torch.fft.fft2(target_fp32, norm='ortho')
+            pred_fft = torch.fft.fftshift(pred_fft, dim=(-2, -1))
+            target_fft = torch.fft.fftshift(target_fft, dim=(-2, -1))
+
+            # 2. 构建高通滤波器 (与 _compute_fft_loss 保持一致)
+            freq_y = torch.linspace(-0.5, 0.5, H, device=pred.device, dtype=torch.float32).view(-1, 1)
+            freq_x = torch.linspace(-0.5, 0.5, W, device=pred.device, dtype=torch.float32).view(1, -1)
+            freq_dist = torch.sqrt(freq_y ** 2 + freq_x ** 2)  # [0, ~0.707]
+            freq_dist = freq_dist / 0.707  # 归一化到 [0, 1]
+
+            cutoff = 0.25
+            sharpness = 12.0
+            highpass_mask = torch.sigmoid((freq_dist - cutoff) * sharpness)
+            highpass_mask = highpass_mask.view(1, 1, H, W)
+
+            # 3. 提取幅度 + 对数压缩
+            eps = 1e-8
+            pred_amp = torch.log1p(pred_fft.abs() + eps)
+            target_amp = torch.log1p(target_fft.abs() + eps)
+
+            # 4. 只在高频区域计算 loss
+            diff = (pred_amp - target_amp).abs()
+            masked_diff = diff * highpass_mask
+
+            # 5. Per-sample reduction (so mean(per-sample) == scalar loss)
+            highpass_sum = highpass_mask.sum()
+            if highpass_sum > 0:
+                per_sample_sum = masked_diff.sum(dim=(1, 2, 3))
+                loss_per_sample = per_sample_sum / (highpass_sum * C)
+            else:
+                loss_per_sample = masked_diff.mean(dim=(1, 2, 3))
+
+            return loss_per_sample.to(original_dtype)
+
+        except RuntimeError as e:
+            if "powers of two" in str(e) or "cuFFT" in str(e):
+                logger.debug(f"FFT loss disabled for dimensions {H}x{W}: {e}")
+                return torch.zeros(B, device=pred.device, dtype=original_dtype)
             else:
                 raise
 
